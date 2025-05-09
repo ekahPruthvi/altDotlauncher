@@ -1,0 +1,10 @@
+[package]
+name = "pipe"
+version = "0.1.0"
+edition = "2021"
+authors = ["ekahPruthvi <ekahpdp@gmail.com>"]
+description = "dynamic info panel for Wayland"
+license = "MIT"
+repository = "https://github.com/ekahPruthvi/pipe.git"
+
+[dependencies]
