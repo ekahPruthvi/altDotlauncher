@@ -1,14 +1,18 @@
 use gtk4::prelude::*;
+use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow,
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable,
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
+use gtk4::glib::{SpawnFlags,Pid,Error};
 use std::cell::RefCell;
 use std::fs;
 use std::rc::Rc;
 use std::process::{Command, exit};
+use vte4::Terminal;
+use vte4::PtyFlags;
 
 fn main() {
     let app = Application::builder()
@@ -16,6 +20,7 @@ fn main() {
         .build();
 
     app.connect_activate(build_ui);
+    Command::new("bash").arg("-c").arg("cd").arg("~/");
     app.run();
 }
 
@@ -67,6 +72,18 @@ fn build_ui(app: &Application) {
         .reveal_child(true)
         .build();
 
+    let terminal = Terminal::new();
+    terminal.set_vexpand(true);
+    terminal.set_hexpand(true);
+
+    let terminal_box = GtkBox::new(Orientation::Vertical, 0);
+    terminal_box.set_widget_name("tbox");
+    terminal_box.set_vexpand(true);
+    terminal_box.set_hexpand(true);
+    terminal_box.set_size_request(1500, 800);
+    terminal_box.append(&terminal);
+    terminal_box.set_visible(false);
+
     let vbox_inner = GtkBox::new(Orientation::Vertical, 12);
     let scroller = ScrolledWindow::new();
     scroller.set_vexpand(true);
@@ -76,6 +93,7 @@ fn build_ui(app: &Application) {
     vbox.append(&entry);
     vbox.append(&result_revealer);
     vbox.append(&scroller);
+    vbox.append(&terminal_box);
     window.set_child(Some(&vbox));
 
     let result = Rc::new(result);
@@ -84,6 +102,9 @@ fn build_ui(app: &Application) {
     let selected_index = Rc::new(RefCell::new(0));
     let current_items = Rc::new(RefCell::new(Vec::new()));
     let current_mode = Rc::new(RefCell::new(Mode::App));
+    let terminal = Rc::new(terminal);
+    let terminal_box = Rc::new(terminal_box);
+
 
     {
         let entry = entry.clone();
@@ -146,42 +167,80 @@ fn build_ui(app: &Application) {
                         *index -= 1;
                     }
                 }
-                gtk4::gdk::Key::Shift_R | gtk4::gdk::Key::Return => {
+                gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::Return => {
                     // Get the selected item
                     if let Some(selected) = items.get(*index) {
                         match *current_mode.borrow() {
                             Mode::App => {
                                 let path = format!("/usr/share/applications/{}.desktop", selected);
                                 if let Ok(contents) = fs::read_to_string(&path) {
+                                    let mut exec_line = None;
+                                    let mut terminal_flag = false;
+
                                     for line in contents.lines() {
+                                        if line.starts_with("Terminal=") {
+                                            terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
+                                        }
                                         if line.starts_with("Exec=") {
-                                            let exec_line = line.trim_start_matches("Exec=")
-                                                                .split_whitespace()
-                                                                .next()
-                                                                .unwrap_or("");
+                                            exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
+                                        }
+                                    }
 
-                                            if !exec_line.is_empty() && exec_line != "bash" {
-                                                println!("Executing: {}", exec_line);
+                                    if let Some(exec) = exec_line {
+                                        if terminal_flag {
+                                            entry.set_visible(false);
+                                            scroller.set_visible(false);
+                                            terminal_box.set_visible(true);
 
-                                                if let Err(e) = Command::new(exec_line).spawn() {
-                                                    eprintln!("Failed to start application: {}", e);
+                                            let command = &exec;
+                                            let argv = ["sh", "-c", command];
+
+                                            terminal.spawn_async(
+                                                PtyFlags::DEFAULT,
+                                                None,                    // working directory
+                                                &argv,                   // command to run
+                                                &[],                     // environment vars
+                                                SpawnFlags::DEFAULT,
+                                                || {},                   // child setup (no-op)
+                                                -1,                      // timeout (-1 means no timeout)
+                                                None::<&Cancellable>,    // no cancellation
+                                                move |res: Result<Pid, Error>| {
+                                                    if let Err(e) = res {
+                                                        eprintln!("Failed to spawn terminal process: {}", e);
+                                                    }
+                                                },
+                                            );
+                                            let terminal_box_clone = terminal_box.clone();
+                                            let entry_clone = entry.clone();
+                                            let scroller_clone=scroller.clone();
+
+                                            terminal.connect_child_exited(move |_terminal, _status| {
+                                                terminal_box_clone.set_visible(false);
+                                                entry_clone.set_visible(true);
+                                                scroller_clone.set_visible(true);
+                                            });
+                                        } else {
+                                            let command = exec.split_whitespace().next().unwrap_or("");
+                                            if !command.is_empty() && command != "bash" {
+                                                if let Err(e) = Command::new(command).spawn() {
+                                                    eprintln!("Failed to start GUI app: {}", e);
                                                 }
                                                 exit(0);
                                             } else {
-                                                eprint!("error running")
+                                                eprintln!("Invalid or unsupported command in Exec=");
                                             }
                                         }
+                                    } else {
+                                        eprintln!("No Exec line found");
                                     }
                                 } else {
                                     eprintln!("Failed to read .desktop file: {}", path);
                                 }
                             }
                             Mode::Notes => {
-                                // Open file with default app
                                 // insert code here
                             }
                             Mode::Ai => {
-                                // Perform a Google search for the selected query
                                 if let Err(e) = Command::new("xdg-open")
                                     .arg(format!("https://www.google.com/search?q={}", selected))
                                     .spawn()
@@ -266,6 +325,14 @@ fn build_ui(app: &Application) {
             padding:10px ;
             border-radius: 5px;
         }
+        #tbox {
+            border-radius: 10px;
+            background-color:rgb(0, 0, 0);
+            padding: 5px;
+            border-style: solid;
+            border-width: 1px ;
+            border-color: rgba(139, 139, 139, 0.5);
+        }
     "#;
 
     let provider = CssProvider::new();
@@ -311,7 +378,6 @@ fn lister(input: &str) -> (Mode, Vec<String>) {
     let filtered = apps
         .into_iter()
         .filter(|s| fuzzy_match(s, input))
-        .take(10)
         .collect();
 
     (Mode::App, filtered)
