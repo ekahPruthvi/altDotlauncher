@@ -58,6 +58,7 @@ fn build_ui(app: &Application) {
         .hexpand(false)
         .activates_default(true)
         .build();
+    entry.set_visible(false);
 
     let result = Label::new(Some(" Moss \ntype `/` to get started"));
     result.set_widget_name("result-card");
@@ -255,6 +256,7 @@ fn build_ui(app: &Application) {
                     }
                 }
                 gtk4::gdk::Key::slash => {
+                    entry.set_visible(true);
                     entry.grab_focus();
                 }
                 gtk4::gdk::Key::Escape => {
@@ -296,7 +298,7 @@ fn build_ui(app: &Application) {
             border-radius: 12px;
             border-style: solid;
             border-width: 2px ;
-            border-color: rgba(109, 109, 109, 0.59);
+            border-color: rgba(73, 73, 73, 0.59);
         }
         #result-card {
             background-color: rgba(139, 139, 139, 0.14);
@@ -313,7 +315,7 @@ fn build_ui(app: &Application) {
             padding-left: 15px;
             border-radius: 10px;
             background-color: rgba(0, 0, 0, 0.1);
-            color: white;
+            color: rgb(207, 207, 207);
         }
         label {
             color: white;
