@@ -131,6 +131,10 @@ fn build_ui(app: &Application) {
 
             result_revealer.set_reveal_child(text.is_empty());
 
+            if text.is_empty(){
+                result.set_label("type");
+            }
+
             // Clear and update vbox_opt
             while let Some(widget) = vbox_opt.first_child() {
                 vbox_opt.remove(&widget);
