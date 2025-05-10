@@ -1,10 +1,13 @@
 [package]
-name = "pipe"
+name = "moss"
 version = "0.1.0"
 edition = "2021"
 authors = ["ekahPruthvi <ekahpdp@gmail.com>"]
-description = "dynamic info panel for Wayland"
+description = "A Mossy dynamicLauncher"
 license = "MIT"
-repository = "https://github.com/ekahPruthvi/pipe.git"
+repository = "https://github.com/ekahPruthvi/moss.git"
 
 [dependencies]
+fuzzy-matcher = "0.3.7"
+glob = "0.3.2"
+gtk4 = "0.9.6"
