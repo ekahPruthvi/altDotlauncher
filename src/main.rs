@@ -48,15 +48,15 @@ fn build_ui(app: &Application) {
     window.add_controller(scroll_controller.clone());
 
     let vbox = GtkBox::new(Orientation::Vertical, 12);
-    vbox.set_margin_top(20);
-    vbox.set_margin_bottom(20);
-    vbox.set_margin_start(20);
-    vbox.set_margin_end(20);
+    // vbox.set_margin_top(20);
+    // vbox.set_margin_bottom(20);
+    // vbox.set_margin_start(20);
+    // vbox.set_margin_end(20);
 
     let entry = Entry::builder()
         .placeholder_text("Search apps, open marker or use alterAi")
-        .hexpand(false)
-        .activates_default(true)
+        .hexpand(true)
+        .activates_default(false)
         .build();
     entry.set_visible(false);
 
@@ -64,6 +64,8 @@ fn build_ui(app: &Application) {
     result.set_widget_name("result-card");
     result.set_margin_top(20);
     result.set_margin_bottom(10);
+    result.set_margin_end(20);
+    result.set_margin_start(20);
     result.hexpands();
 
     let result_revealer = Revealer::builder()
@@ -82,6 +84,10 @@ fn build_ui(app: &Application) {
     terminal_box.set_vexpand(true);
     terminal_box.set_hexpand(true);
     terminal_box.set_size_request(1500, 800);
+    terminal_box.set_margin_start(4);
+    terminal_box.set_margin_end(4);
+    terminal_box.set_margin_top(4);
+    terminal_box.set_margin_bottom(4);
     terminal_box.append(&terminal);
     terminal_box.set_visible(false);
 
@@ -134,6 +140,7 @@ fn build_ui(app: &Application) {
                 let label = Label::new(Some(item));
                 label.set_widget_name(if i == 0 { "highlighted" } else { "" });
                 label.set_halign(gtk4::Align::Start);
+                label.set_margin_start(20);
                 vbox_opt.append(&label);
             }
 
@@ -313,9 +320,10 @@ fn build_ui(app: &Application) {
             border:none;
             padding: 10px;
             padding-left: 15px;
-            border-radius: 10px;
+            border-radius: 0px;
             background-color: rgba(0, 0, 0, 0.1);
             color: rgb(207, 207, 207);
+            box-shadow:none;
         }
         label {
             color: white;
