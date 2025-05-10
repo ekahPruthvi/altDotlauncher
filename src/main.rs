@@ -296,7 +296,7 @@ fn build_ui(app: &Application) {
             border-radius: 12px;
             border-style: solid;
             border-width: 2px ;
-            border-color: rgba(139, 139, 139, 0.59);
+            border-color: rgba(109, 109, 109, 0.59);
         }
         #result-card {
             background-color: rgba(139, 139, 139, 0.14);
