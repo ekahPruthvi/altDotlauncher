@@ -377,6 +377,16 @@ fn lister(input: &str) -> (Mode, Vec<String>) {
         );
     }
 
+    if input.starts_with('>') {
+        let app = Command::new("bash")
+        .arg("-c")
+        .arg("find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' -printf '%f\n' | sed 's/\\.desktop$//' | sort")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+        return (Mode::App, app);
+    }
+
     // App mode with fuzzy matching
     let apps = Command::new("bash")
         .arg("-c")
