@@ -116,7 +116,6 @@ fn build_ui(app: &Application) {
     {
         let entry = entry.clone();
         let vbox_opt = vbox_opt.clone();
-        let result = result.clone();
         let result_revealer = result_revealer.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
@@ -132,7 +131,9 @@ fn build_ui(app: &Application) {
             result_revealer.set_reveal_child(text.is_empty());
 
             if text.is_empty(){
-                result.set_label("type");
+                vbox_opt.set_visible(false);
+            }else {
+                vbox_opt.set_visible(true);
             }
 
             // Clear and update vbox_opt
@@ -148,11 +149,6 @@ fn build_ui(app: &Application) {
                 vbox_opt.append(&label);
             }
 
-            result.set_text(
-                items.get(0)
-                    .map(|s| s.as_str())
-                    .unwrap_or("No match"),
-            );
         });
     }
 
