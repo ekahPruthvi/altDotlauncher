@@ -14,6 +14,7 @@ use std::process::{Command, exit};
 use vte4::Terminal;
 use vte4::PtyFlags;
 use std::path::Path;
+use chrono::{Local, DateTime};
 
 fn main() {
     let app = Application::builder()
@@ -29,7 +30,8 @@ fn main() {
 enum Mode {
     App,
     Notes,
-    Ai
+    Ai,
+    None
 }
 
 
@@ -56,24 +58,24 @@ fn build_ui(app: &Application) {
     // vbox.set_margin_end(20);
 
     let entry = Entry::builder()
-        .placeholder_text("Search apps, open marker or use alterAi")
+        .placeholder_text(" Search apps, open marker or use alterAi")
         .hexpand(true)
         .activates_default(false)
         .build();
     entry.set_visible(false);
 
-    let result = Label::new(Some(" Moss \ntype `/` to get started"));
-    result.set_widget_name("result-card");
-    result.set_margin_top(20);
-    result.set_margin_bottom(10);
-    result.set_margin_end(20);
-    result.set_margin_start(20);
-    result.hexpands();
+    let info_lable = Label::new(Some(" Moss \ntype `/` to get started"));
+    info_lable.set_widget_name("info_lable-card");
+    info_lable.set_margin_top(20);
+    info_lable.set_margin_bottom(10);
+    info_lable.set_margin_end(20);
+    info_lable.set_margin_start(20);
+    info_lable.hexpands();
 
-    let result_revealer = Revealer::builder()
+    let info_lable_revealer = Revealer::builder()
         .transition_type(RevealerTransitionType::SlideUp)
         .transition_duration(300)
-        .child(&result)
+        .child(&info_lable)
         .reveal_child(true)
         .build();
 
@@ -100,12 +102,12 @@ fn build_ui(app: &Application) {
     scroller.set_child(Some(&vbox_inner));
 
     vbox.append(&entry);
-    vbox.append(&result_revealer);
+    vbox.append(&info_lable_revealer);
     vbox.append(&scroller);
     vbox.append(&terminal_box);
     window.set_child(Some(&vbox));
 
-    let result_revealer = Rc::new(result_revealer);
+    let info_lable_revealer = Rc::new(info_lable_revealer);
     let vbox_opt = Rc::new(vbox_inner);
     let selected_index = Rc::new(RefCell::new(0));
     let current_items = Rc::new(RefCell::new(Vec::new()));
@@ -118,23 +120,37 @@ fn build_ui(app: &Application) {
     {
         let entry = entry.clone();
         let vbox_opt = vbox_opt.clone();
-        let result_revealer = result_revealer.clone();
+        let info_lable_revealer = info_lable_revealer.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
+        let info = info_lable.clone(); 
 
         entry.connect_changed(move |e| {
             let text = e.text().to_string();
             let (mode, items, file_path_name) = lister(&text);
+            let mut _res_flag = false;
             *current_mode.borrow_mut() = mode.clone();
             *current_items.borrow_mut() = items.clone();
             *current_file_path_name.borrow_mut() = file_path_name.clone();
             *selected_index.borrow_mut() = 0;
+            
+            // info flags
+            if text == ">t"{
+                let now: DateTime<Local> = Local::now();
+                let datetime_am_pm = now.format(" %B %e,\n%l:%M %P").to_string();
+                info.set_text(&datetime_am_pm);
+                _res_flag = true
 
-            result_revealer.set_reveal_child(text.is_empty());
+            } else {
+                info.set_text(" type\n` for marker\n ! for alterAi");
+                _res_flag = false
+            }
 
-            if text.is_empty(){
+            info_lable_revealer.set_reveal_child(text.is_empty() || _res_flag);
+
+            if text.is_empty() || _res_flag {
                 vbox_opt.set_visible(false);
             }else {
                 vbox_opt.set_visible(true);
@@ -184,99 +200,82 @@ fn build_ui(app: &Application) {
                 }
                 gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::Return => {
                     // Get the selected item
-                    if let Some(selected) = items.get(*index) {
                         if let Some(file_name) = file_path_name.get(*index) {
-                          let path_str = format!("{}",&file_name);  
-                            match *current_mode.borrow() {
-                                Mode::App => { 
-                                    let path = Path::new(&path_str);
-                                    if let Ok(contents) = fs::read_to_string(&path) {
-                                        let mut exec_line = None;
-                                        let mut terminal_flag = false;
+                            let path_str = format!("{}",&file_name);  
+                            let path = Path::new(&path_str);
+                            if let Ok(contents) = fs::read_to_string(&path) {
+                                let mut exec_line = None;
+                                let mut terminal_flag = false;
 
-                                        for line in contents.lines() {
-                                            if line.starts_with("Terminal=") {
-                                                terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
-                                            }
-                                            if line.starts_with("Exec=") {
-                                                exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
-                                            }
-                                        }
+                                for line in contents.lines() {
+                                    if line.starts_with("Terminal=") {
+                                        terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
+                                    }
+                                    if line.starts_with("Exec=") {
+                                        exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
+                                    }
+                                }
 
-                                        if let Some(exec) = exec_line {
-                                            if terminal_flag {
-                                                entry.set_visible(false);
-                                                scroller.set_visible(false);
-                                                terminal_box.set_visible(true);
+                                if let Some(exec) = exec_line {
+                                    if terminal_flag {
+                                        entry.set_visible(false);
+                                        scroller.set_visible(false);
+                                        terminal_box.set_visible(true);
 
-                                                let command = &exec;
-                                                let argv = ["sh", "-c", command];
+                                        let command = &exec;
+                                        let argv = ["sh", "-c", command];
 
-                                                terminal.spawn_async(
-                                                    PtyFlags::DEFAULT,
-                                                    None,                    // working directory
-                                                    &argv,                   // command to run
-                                                    &[],                     // environment vars
-                                                    SpawnFlags::DEFAULT,
-                                                    || {},                   // child setup (no-op)
-                                                    -1,                      // timeout (-1 means no timeout)
-                                                    None::<&Cancellable>,    // no cancellation
-                                                    move |res: Result<Pid, Error>| {
-                                                        if let Err(e) = res {
-                                                            eprintln!("Failed to spawn terminal process: {}", e);
-                                                        }
-                                                    },
-                                                );
-                                                let terminal_box_clone = terminal_box.clone();
-                                                let entry_clone = entry.clone();
-                                                let scroller_clone=scroller.clone();
-
-                                                terminal.connect_child_exited(move |_terminal, _status| {
-                                                    terminal_box_clone.set_visible(false);
-                                                    entry_clone.set_visible(true);
-                                                    scroller_clone.set_visible(true);
-                                                });
-                                            } else {
-                                                let command = exec.split_whitespace().next().unwrap_or("");
-                                                if !command.is_empty() && command != "bash" {
-                                                    if let Err(e) = Command::new(command).spawn() {
-                                                        eprintln!("Failed to start GUI app: {}", e);
-                                                    }
-                                                    exit(0);
-                                                } else {
-                                                    eprintln!("Invalid or unsupported command in Exec=");
+                                        terminal.spawn_async(
+                                            PtyFlags::DEFAULT,
+                                            None,                    // working directory
+                                            &argv,                   // command to run
+                                            &[],                     // environment vars
+                                            SpawnFlags::DEFAULT,
+                                            || {},                   // child setup (no-op)
+                                            -1,                      // timeout (-1 means no timeout)
+                                            None::<&Cancellable>,    // no cancellation
+                                            move |res: Result<Pid, Error>| {
+                                                if let Err(e) = res {
+                                                    eprintln!("Failed to spawn terminal process: {}", e);
                                                 }
-                                            }
-                                        } else {
-                                            eprintln!("No Exec line found");
-                                        }
+                                            },
+                                        );
+                                        let terminal_box_clone = terminal_box.clone();
+                                        let entry_clone = entry.clone();
+                                        let scroller_clone=scroller.clone();
+
+                                        terminal.connect_child_exited(move |_terminal, _status| {
+                                            terminal_box_clone.set_visible(false);
+                                            entry_clone.set_visible(true);
+                                            scroller_clone.set_visible(true);
+                                        });
                                     } else {
-                                        eprintln!("Failed to read .desktop file: {}", path_str);
+                                        let command = exec.split_whitespace().next().unwrap_or("");
+                                        if !command.is_empty() && command != "bash" {
+                                            if let Err(e) = Command::new(command).spawn() {
+                                                eprintln!("Failed to start GUI app: {}", e);
+                                            }
+                                            exit(0);
+                                        } else {
+                                            eprintln!("Invalid or unsupported command in Exec=");
+                                        }
                                     }
+                                } else {
+                                    eprintln!("No Exec line found");
                                 }
-                                Mode::Notes => {
-                                    // insert code here
-                                }
-                                Mode::Ai => {
-                                    if let Err(e) = Command::new("xdg-open")
-                                        .arg(format!("https://www.google.com/search?q={}", selected))
-                                        .spawn()
-                                    {
-                                        eprintln!("Failed to open web search: {}", e);
-                                    }
-                                    exit(0);
-                                }   
+                            } else {
+                                eprintln!("Failed to read .desktop file: {}", path_str);
                             }
+                            
                         } else {
                                 eprintln!("No pathname returned for selected index");
                         }
-                    } else {
-                        eprint!("error nothing selected")
-                    }
+                    
                 }
                 gtk4::gdk::Key::slash => {
                     entry.set_visible(true);
                     entry.grab_focus();
+                    info_lable.set_text(" type\n` for marker\n ! for alterAi");
                 }
                 gtk4::gdk::Key::Escape => {
                     std::process::exit(0);
@@ -300,9 +299,9 @@ fn build_ui(app: &Application) {
     }
 
     {
-        let result_revealer = result_revealer.clone();
+        let info_lable_revealer = info_lable_revealer.clone();
         scroll_controller.connect_scroll(move |_, _, _| {
-            result_revealer.set_reveal_child(false);
+            info_lable_revealer.set_reveal_child(false);
             glib::Propagation::Stop
         });
     }
@@ -315,7 +314,7 @@ fn build_ui(app: &Application) {
             border-width: 2px ;
             border-color: rgba(73, 73, 73, 0.59);
         }
-        #result-card {
+        #info_lable-card {
             background-color: rgba(139, 139, 139, 0.14);
             padding: 100px;
             border-radius: 12px;
@@ -333,6 +332,7 @@ fn build_ui(app: &Application) {
             color: rgba(207, 207, 207, 0.9);
             box-shadow:none;
             font-family: "Cantarell";
+            font-weight: 400;
         }
         label {
             color: white;
@@ -424,6 +424,21 @@ fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
     }
 
     if input.starts_with('>') {
+        let second_chary = input.chars().nth(1);
+        // check for info flages
+        match second_chary {
+            Some(t) => {
+                let mut temp = Vec::new();
+                if t == 't' {
+                    temp.clear();
+                    temp.push("Time::now()".to_string());
+                    return (Mode::None,temp,Vec::new());
+                }
+            }
+            _ => {
+            }
+        }
+
         let (entries, paths): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
         return (Mode::App, entries, paths);
     }
