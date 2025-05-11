@@ -309,7 +309,7 @@ fn build_ui(app: &Application) {
 
     let css = r#"
         window {
-            background-color: rgba(30, 30, 30, 0.6);
+            background-color: rgba(20, 37, 27, 0.6);
             border-radius: 12px;
             border-style: solid;
             border-width: 2px ;
@@ -330,8 +330,9 @@ fn build_ui(app: &Application) {
             padding-left: 15px;
             border-radius: 0px;
             background-color: rgba(0, 0, 0, 0.1);
-            color: rgb(207, 207, 207);
+            color: rgba(207, 207, 207, 0.9);
             box-shadow:none;
+            font-family: "Cantarell";
         }
         label {
             color: white;
