@@ -179,7 +179,7 @@ fn build_ui(app: &Application) {
         let vbox_opt = vbox_opt.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
-        let current_mode = current_mode.clone();
+        //let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
 
         event_controller.connect_key_pressed(move |_, key, _, _| {
@@ -424,19 +424,9 @@ fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
     }
 
     if input.starts_with('>') {
-        let second_chary = input.chars().nth(1);
         // check for info flages
-        match second_chary {
-            Some(t) => {
-                let mut temp = Vec::new();
-                if t == 't' {
-                    temp.clear();
-                    temp.push("Time::now()".to_string());
-                    return (Mode::None,temp,Vec::new());
-                }
-            }
-            _ => {
-            }
+        if input.len() > 1  {
+            return (Mode::None,Vec::new(),Vec::new());
         }
 
         let (entries, paths): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
