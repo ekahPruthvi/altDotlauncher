@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable,
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::process::{Command, exit};
 use vte4::Terminal;
 use vte4::PtyFlags;
+use std::path::Path;
 
 fn main() {
     let app = Application::builder()
@@ -30,6 +31,7 @@ enum Mode {
     Notes,
     Ai
 }
+
 
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
@@ -103,12 +105,12 @@ fn build_ui(app: &Application) {
     vbox.append(&terminal_box);
     window.set_child(Some(&vbox));
 
-    let result = Rc::new(result);
     let result_revealer = Rc::new(result_revealer);
     let vbox_opt = Rc::new(vbox_inner);
     let selected_index = Rc::new(RefCell::new(0));
     let current_items = Rc::new(RefCell::new(Vec::new()));
     let current_mode = Rc::new(RefCell::new(Mode::App));
+    let current_file_path_name= Rc::new(RefCell::new(Vec::new()));
     let terminal = Rc::new(terminal);
     let terminal_box = Rc::new(terminal_box);
 
@@ -120,12 +122,14 @@ fn build_ui(app: &Application) {
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
         let current_mode = current_mode.clone();
+        let current_file_path_name=current_file_path_name.clone();
 
         entry.connect_changed(move |e| {
             let text = e.text().to_string();
-            let (mode, items) = lister(&text);
+            let (mode, items, file_path_name) = lister(&text);
             *current_mode.borrow_mut() = mode.clone();
             *current_items.borrow_mut() = items.clone();
+            *current_file_path_name.borrow_mut() = file_path_name.clone();
             *selected_index.borrow_mut() = 0;
 
             result_revealer.set_reveal_child(text.is_empty());
@@ -146,6 +150,8 @@ fn build_ui(app: &Application) {
                 label.set_widget_name(if i == 0 { "highlighted" } else { "" });
                 label.set_halign(gtk4::Align::Start);
                 label.set_margin_start(20);
+                label.set_margin_end(20);
+                label.set_margin_bottom(20);
                 vbox_opt.append(&label);
             }
 
@@ -153,16 +159,17 @@ fn build_ui(app: &Application) {
     }
 
     {
-        let result = result.clone();
         let entry = entry.clone();
         let vbox_opt = vbox_opt.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
         let current_mode = current_mode.clone();
+        let current_file_path_name=current_file_path_name.clone();
 
         event_controller.connect_key_pressed(move |_, key, _, _| {
             let mut index = selected_index.borrow_mut();
             let items = current_items.borrow();
+            let file_path_name=current_file_path_name.borrow();
 
             match key {
                 gtk4::gdk::Key::Down => {
@@ -178,85 +185,90 @@ fn build_ui(app: &Application) {
                 gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::Return => {
                     // Get the selected item
                     if let Some(selected) = items.get(*index) {
-                        match *current_mode.borrow() {
-                            Mode::App => {
-                                let path = format!("/usr/share/applications/{}.desktop", selected);
-                                if let Ok(contents) = fs::read_to_string(&path) {
-                                    let mut exec_line = None;
-                                    let mut terminal_flag = false;
+                        if let Some(file_name) = file_path_name.get(*index) {
+                          let path_str = format!("{}",&file_name);  
+                            match *current_mode.borrow() {
+                                Mode::App => { 
+                                    let path = Path::new(&path_str);
+                                    if let Ok(contents) = fs::read_to_string(&path) {
+                                        let mut exec_line = None;
+                                        let mut terminal_flag = false;
 
-                                    for line in contents.lines() {
-                                        if line.starts_with("Terminal=") {
-                                            terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
-                                        }
-                                        if line.starts_with("Exec=") {
-                                            exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
-                                        }
-                                    }
-
-                                    if let Some(exec) = exec_line {
-                                        if terminal_flag {
-                                            entry.set_visible(false);
-                                            scroller.set_visible(false);
-                                            terminal_box.set_visible(true);
-
-                                            let command = &exec;
-                                            let argv = ["sh", "-c", command];
-
-                                            terminal.spawn_async(
-                                                PtyFlags::DEFAULT,
-                                                None,                    // working directory
-                                                &argv,                   // command to run
-                                                &[],                     // environment vars
-                                                SpawnFlags::DEFAULT,
-                                                || {},                   // child setup (no-op)
-                                                -1,                      // timeout (-1 means no timeout)
-                                                None::<&Cancellable>,    // no cancellation
-                                                move |res: Result<Pid, Error>| {
-                                                    if let Err(e) = res {
-                                                        eprintln!("Failed to spawn terminal process: {}", e);
-                                                    }
-                                                },
-                                            );
-                                            let terminal_box_clone = terminal_box.clone();
-                                            let entry_clone = entry.clone();
-                                            let scroller_clone=scroller.clone();
-
-                                            terminal.connect_child_exited(move |_terminal, _status| {
-                                                terminal_box_clone.set_visible(false);
-                                                entry_clone.set_visible(true);
-                                                scroller_clone.set_visible(true);
-                                            });
-                                        } else {
-                                            let command = exec.split_whitespace().next().unwrap_or("");
-                                            if !command.is_empty() && command != "bash" {
-                                                if let Err(e) = Command::new(command).spawn() {
-                                                    eprintln!("Failed to start GUI app: {}", e);
-                                                }
-                                                exit(0);
-                                            } else {
-                                                eprintln!("Invalid or unsupported command in Exec=");
+                                        for line in contents.lines() {
+                                            if line.starts_with("Terminal=") {
+                                                terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
+                                            }
+                                            if line.starts_with("Exec=") {
+                                                exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
                                             }
                                         }
+
+                                        if let Some(exec) = exec_line {
+                                            if terminal_flag {
+                                                entry.set_visible(false);
+                                                scroller.set_visible(false);
+                                                terminal_box.set_visible(true);
+
+                                                let command = &exec;
+                                                let argv = ["sh", "-c", command];
+
+                                                terminal.spawn_async(
+                                                    PtyFlags::DEFAULT,
+                                                    None,                    // working directory
+                                                    &argv,                   // command to run
+                                                    &[],                     // environment vars
+                                                    SpawnFlags::DEFAULT,
+                                                    || {},                   // child setup (no-op)
+                                                    -1,                      // timeout (-1 means no timeout)
+                                                    None::<&Cancellable>,    // no cancellation
+                                                    move |res: Result<Pid, Error>| {
+                                                        if let Err(e) = res {
+                                                            eprintln!("Failed to spawn terminal process: {}", e);
+                                                        }
+                                                    },
+                                                );
+                                                let terminal_box_clone = terminal_box.clone();
+                                                let entry_clone = entry.clone();
+                                                let scroller_clone=scroller.clone();
+
+                                                terminal.connect_child_exited(move |_terminal, _status| {
+                                                    terminal_box_clone.set_visible(false);
+                                                    entry_clone.set_visible(true);
+                                                    scroller_clone.set_visible(true);
+                                                });
+                                            } else {
+                                                let command = exec.split_whitespace().next().unwrap_or("");
+                                                if !command.is_empty() && command != "bash" {
+                                                    if let Err(e) = Command::new(command).spawn() {
+                                                        eprintln!("Failed to start GUI app: {}", e);
+                                                    }
+                                                    exit(0);
+                                                } else {
+                                                    eprintln!("Invalid or unsupported command in Exec=");
+                                                }
+                                            }
+                                        } else {
+                                            eprintln!("No Exec line found");
+                                        }
                                     } else {
-                                        eprintln!("No Exec line found");
+                                        eprintln!("Failed to read .desktop file: {}", path_str);
                                     }
-                                } else {
-                                    eprintln!("Failed to read .desktop file: {}", path);
                                 }
-                            }
-                            Mode::Notes => {
-                                // insert code here
-                            }
-                            Mode::Ai => {
-                                if let Err(e) = Command::new("xdg-open")
-                                    .arg(format!("https://www.google.com/search?q={}", selected))
-                                    .spawn()
-                                {
-                                    eprintln!("Failed to open web search: {}", e);
+                                Mode::Notes => {
+                                    // insert code here
                                 }
-                                exit(0);
+                                Mode::Ai => {
+                                    if let Err(e) = Command::new("xdg-open")
+                                        .arg(format!("https://www.google.com/search?q={}", selected))
+                                        .spawn()
+                                    {
+                                        eprintln!("Failed to open web search: {}", e);
+                                    }
+                                    exit(0);
+                                }   
                             }
+                        } else {
+                                eprintln!("No pathname returned for selected index");
                         }
                     } else {
                         eprint!("error nothing selected")
@@ -282,11 +294,7 @@ fn build_ui(app: &Application) {
                 }
                 i += 1;
             }
-
-            if let Some(selected) = items.get(*index) {
-                result.set_text(selected);
-            }
-
+            
             glib::Propagation::Stop
         });
     }
@@ -317,7 +325,7 @@ fn build_ui(app: &Application) {
             font-weight: 700;
         }
         entry {
-            border:none;
+            border-bottom: 1px solid rgba(73, 73, 73, 0.59);
             padding: 10px;
             padding-left: 15px;
             border-radius: 0px;
@@ -347,6 +355,7 @@ fn build_ui(app: &Application) {
 
     let provider = CssProvider::new();
     provider.load_from_data(css);
+    // I wrote thiss yeeey ekahPruthvi <ekahpdp@gmail.com>
     gtk4::style_context_add_provider_for_display(
         &Display::default().unwrap(),
         &provider,
@@ -356,17 +365,15 @@ fn build_ui(app: &Application) {
     window.show();
 }
 
-fn lister(input: &str) -> (Mode, Vec<String>) {
+fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
     if input.starts_with('`') {
-        // dummy return
-        let entries:Vec<String> = Vec::new();
-        return (Mode::Notes, entries);
+        return (Mode::Notes, Vec::new(), Vec::new());
     }
 
     if input.starts_with('!') {
         let query = input.trim_start_matches('!');
         if query.is_empty() {
-            return (Mode::Ai, vec![]);
+            return (Mode::Ai, vec![], Vec::new());
         }
         return (
             Mode::Ai,
@@ -374,38 +381,65 @@ fn lister(input: &str) -> (Mode, Vec<String>) {
                 format!("Search: {}", query),
                 format!("{} : Wikipedia", query),
             ],
+            Vec::new()
         );
     }
 
-    if input.starts_with('>') {
-        let app = Command::new("bash")
-        .arg("-c")
-        .arg("find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' -printf '%f\n' | sed 's/\\.desktop$//' | sort")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect::<Vec<_>>())
-        .unwrap_or_default();
-        return (Mode::App, app);
+    let mut pairs = Vec::new(); // Vec<(app_name, path_str)>
+
+    if let Ok(read_dir) = fs::read_dir("/usr/share/applications") {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+
+            if let Ok(content) = fs::read_to_string(&path) {
+                if content.lines().any(|line| line.trim() == "NoDisplay=true") {
+                    continue;
+                }
+
+                let mut in_desktop_entry = false;
+                let mut app_name = None;
+
+                for line in content.lines() {
+                    let line = line.trim();
+
+                    if line.starts_with('[') {
+                        in_desktop_entry = line == "[Desktop Entry]";
+                    }
+
+                    if in_desktop_entry && line.starts_with("Name=") {
+                        app_name = Some(line.trim_start_matches("Name=").to_string());
+                        break;
+                    }
+                }
+
+                if let (Some(name), Some(path_str)) = (app_name, path.to_str()) {
+                    pairs.push((name, path_str.to_string()));
+                }
+            }
+        }
     }
 
-    // App mode with fuzzy matching
-    let apps = Command::new("bash")
-        .arg("-c")
-        .arg("find /usr/share/applications -maxdepth 1 -type f -name '*.desktop' -printf '%f\n' | sed 's/\\.desktop$//' | sort")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect::<Vec<_>>())
-        .unwrap_or_default();
+    if input.starts_with('>') {
+        let (entries, paths): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        return (Mode::App, entries, paths);
+    }
 
-    let filtered = apps
+    let filtered: Vec<(String, String)> = pairs
         .into_iter()
-        .filter(|s| fuzzy_match(s, input))
+        .filter(|(name, _)| fuzzy_match(name, input))
         .collect();
 
-    (Mode::App, filtered)
+    let (entries, paths): (Vec<_>, Vec<_>) = filtered.into_iter().unzip();
+    (Mode::App, entries, paths)
 }
 
 fn fuzzy_match(text: &str, pattern: &str) -> bool {
-    let mut t_chars = text.chars();
-    for pc in pattern.chars() {
+    let binding = text.to_lowercase();
+    let mut t_chars = binding.chars();
+    for pc in pattern.to_lowercase().chars() {
         if let Some(_) = t_chars.find(|&tc| tc == pc) {
             continue;
         } else {
