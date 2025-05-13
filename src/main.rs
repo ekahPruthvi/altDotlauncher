@@ -228,9 +228,7 @@ fn build_ui(app: &Application) {
 
 
     {
-        let entry = entry.clone();
         let vbox_opt = vbox_opt.clone();
-        let info_lable_revealer = info_lable_revealer.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
         let current_mode = current_mode.clone();
@@ -288,13 +286,7 @@ fn build_ui(app: &Application) {
         });
     }
 
-    {
-        let vbox_opt = vbox_opt.clone();
-        let selected_index = selected_index.clone();
-        let current_items = current_items.clone();
-        let current_mode = current_mode.clone();
-        let current_file_path_name=current_file_path_name.clone();
-        
+    {   
         event_controller.connect_key_pressed(move |_, key, _, _| {
             let mut index = selected_index.borrow_mut();
             let items = current_items.borrow();
@@ -381,7 +373,6 @@ fn build_ui(app: &Application) {
                             aiscroller.set_visible(true);
                             inpute.grab_focus();
                             let qs = Rc::new(RefCell::new(String::new()));
-                            let qs_clone = qs.clone();
                             let inp = inpute.clone();
                             let rep = reply.clone();
                             let sr = scroller.clone();
@@ -393,7 +384,6 @@ fn build_ui(app: &Application) {
                             inpute.connect_activate(move |e| {
                                 aiinfo.set_visible(false);
                                 let input = e.text().to_string();
-                                *qs_clone.borrow_mut() = input.clone();
                                 let qs_later = qs.clone();
                                 let api_key = read_api_key().to_string();
                                 let qss = qs_later.borrow();
