@@ -1015,11 +1015,9 @@ version = "1.0.9"
 dependencies = [
  "chrono",
  "fuzzy-matcher",
- "glib",
  "glob",
  "groq-api-rust",
  "gtk4",
- "tokio",
  "vte4",
 ]
 

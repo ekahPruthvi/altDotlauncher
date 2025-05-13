@@ -84,6 +84,8 @@ fn ai_typing_effect(label: &Label, text: &str, delay_ms: u64, scr: &ScrolledWind
             } else {
                 scr.set_size_request(1000, 800); 
             }
+            let vadj = scr.vadjustment();
+            vadj.set_value(vadj.upper());
             glib::ControlFlow::Continue
         } else {
             glib::ControlFlow::Break
@@ -157,8 +159,19 @@ fn build_ui(app: &Application) {
 
     let alterai_closure = GtkBox::new(Orientation::Vertical, 12);
     let aiscroller = ScrolledWindow::new();
+    aiscroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
+    aiscroller.add_css_class("no");
     let reply = Label::new(Some(""));
-    let aiinfo = Label::new(Some("alterAi has memory loss,\n so it will not be able to remember conversations."));
+    let aiinfo = Label::new(Some(" alterAi has memory loss,\n so it will not be able to remember conversations."));
+    let dummy = GtkBox::new(Orientation::Vertical, 0);
+    dummy.set_vexpand(true);
+
+    aiinfo.set_margin_start(20);
+    aiinfo.set_margin_end(20);
+    aiinfo.set_margin_top(10);
+    aiinfo.set_margin_bottom(30);
+    aiinfo.set_widget_name("aiinfo");
+
     aiscroller.set_vexpand(true);
     aiscroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     
@@ -180,11 +193,12 @@ fn build_ui(app: &Application) {
     reply.set_visible(false);
 
     let inpute = Entry::builder()
-        .placeholder_text("ask alterAi")
+        .placeholder_text(" ask alterAi")
         .hexpand(true)
         .build();
     inpute.set_widget_name("aitry");
 
+    alterai_closure.append(&dummy);
     alterai_closure.append(&aiinfo);
     alterai_closure.append(&reply);
     alterai_closure.append(&inpute);
@@ -385,7 +399,7 @@ fn build_ui(app: &Application) {
                                 let clo= alterai_closure.clone();
                                 let aiinfo = aiinfo.clone();
                                 inpute.connect_activate(move |e| {
-                                    aiinfo.set_visible(true);
+                                    aiinfo.set_visible(false);
                                     let input = e.text().to_string();
                                     *qs_clone.borrow_mut() = input.clone();
                                     let qs_later = qs.clone();
@@ -397,7 +411,6 @@ fn build_ui(app: &Application) {
                                         info.set_visible(true);
                                         ai.set_visible(false);
                                     }
-                                    info.set_text("Thinking");
                                     let client = GroqClient::new(api_key.to_string(), None);
                                     let messages = vec![ChatCompletionMessage {
                                         role: ChatCompletionRoles::User,
@@ -406,7 +419,6 @@ fn build_ui(app: &Application) {
                                     }];
                                     let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
                                     let response = client.chat_completion(request).unwrap();
-                                    info.set_visible(false);
                                     rep.set_visible(true);
                                     ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
                                     assert!(!response.choices.is_empty());
@@ -516,17 +528,32 @@ fn build_ui(app: &Application) {
             font-weight: 500;
         }
         #aitry{
-            border-top: 1px solid rgba(139, 139, 139, 0.59);
+            border-top: 0.5px solid rgba(139, 139, 139, 0.59);
             padding: 10px;
             padding-left: 15px;
-            border-bottom-right-radius: 12px;
             border-bottom-left-radius: 12px;
+            border-bottom-right-radius: 12px;
             background-color: rgba(0, 0, 0, 0.1);
             color: rgba(224, 222, 222, 0.9);
             box-shadow:none;
             font-family: "Cantarell";
             font-weight: 400; 
         }
+        #aiinfo {
+            background-color: rgba(139, 139, 139, 0.14);
+            padding: 80px;
+            border-radius: 12px;
+            font-size: 30px;
+            border: 0.5px solid rgba(139, 139, 139, 0.59);
+            font-family: "Adwaita Sans";
+            font-weight: 700;
+        }
+        .no scrollbar {
+            opacity: 0;
+            min-width: 0;
+            min-height: 0;
+        }   
+
     "#;
 
     let provider = CssProvider::new();
