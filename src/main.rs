@@ -114,9 +114,6 @@ fn build_ui(app: &Application) {
     let event_controller = gtk4::EventControllerKey::new();
     window.add_controller(event_controller.clone());
 
-    let scroll_controller = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-    window.add_controller(scroll_controller.clone());
-
     let vbox = GtkBox::new(Orientation::Vertical, 12);
 
     let entry = Entry::builder()
@@ -291,8 +288,6 @@ fn build_ui(app: &Application) {
         });
     }
 
-   
-
     {
         let vbox_opt = vbox_opt.clone();
         let selected_index = selected_index.clone();
@@ -466,14 +461,6 @@ fn build_ui(app: &Application) {
         });
     }
     
-    {
-        let info_lable_revealer = info_lable_revealer.clone();
-        scroll_controller.connect_scroll(move |_, _, _| {
-            info_lable_revealer.set_reveal_child(false);
-            glib::Propagation::Stop
-        });
-    }
-
     let css = r#"
         window {
             background-color: rgba(20, 37, 27, 0.6);
