@@ -260,8 +260,6 @@ fn build_ui(app: &Application) {
                 typing_effect(&info, "Ask\nalterAi", 50);
                 _res_flag = true;
                 info.set_widget_name("info_lable-card");
-            } else if text_in_entry.contains("!"){
-                 _res_flag = true;
             } else {
                 info.set_text(" type\n` for marker\n ! for alterAi");
                 _res_flag = false;
