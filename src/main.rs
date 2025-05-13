@@ -288,12 +288,12 @@ fn build_ui(app: &Application) {
                 label.set_margin_bottom(20);
                 vbox_opt.append(&label);
             }
-
         });
     }
 
+   
+
     {
-        let entry = entry.clone();
         let vbox_opt = vbox_opt.clone();
         let selected_index = selected_index.clone();
         let current_items = current_items.clone();
@@ -304,7 +304,6 @@ fn build_ui(app: &Application) {
             let mut index = selected_index.borrow_mut();
             let items = current_items.borrow();
             let file_path_name=current_file_path_name.borrow();
-
             match key {
                 gtk4::gdk::Key::Down => {
                     if *index + 1 < items.len() {
@@ -316,132 +315,130 @@ fn build_ui(app: &Application) {
                         *index -= 1;
                     }
                 }
-                gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::Return => {
-                    // Get the selected item
-                        if let Some(file_name) = file_path_name.get(*index) {
-                            let path_str = format!("{}",&file_name);  
-                            let path = Path::new(&path_str);
-                            if let Ok(contents) = fs::read_to_string(&path) {
-                                let mut exec_line = None;
-                                let mut terminal_flag = false;
+                gtk4::gdk::Key::Alt_L => {
+                    if let Some(file_name) = file_path_name.get(*index) {
+                        let path_str = format!("{}",&file_name);  
+                        let path = Path::new(&path_str);
+                        if let Ok(contents) = fs::read_to_string(&path) {
+                            let mut exec_line = None;
+                            let mut terminal_flag = false;
 
-                                for line in contents.lines() {
-                                    if line.starts_with("Terminal=") {
-                                        terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
-                                    }
-                                    if line.starts_with("Exec=") {
-                                        exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
-                                    }
+                            for line in contents.lines() {
+                                if line.starts_with("Terminal=") {
+                                    terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
                                 }
-
-                                if let Some(exec) = exec_line {
-                                    if terminal_flag {
-                                        entry.set_visible(false);
-                                        scroller.set_visible(false);
-                                        terminal_box.set_visible(true);
-
-                                        let command = &exec;
-                                        let argv = ["sh", "-c", command];
-
-                                        terminal.spawn_async(
-                                            PtyFlags::DEFAULT,
-                                            None,                    // working directory
-                                            &argv,                   // command to run
-                                            &[],                     // environment vars
-                                            SpawnFlags::DEFAULT,
-                                            || {},                   // child setup (no-op)
-                                            -1,                      // timeout (-1 means no timeout)
-                                            None::<&Cancellable>,    // no cancellation
-                                            move |res: Result<Pid, Error>| {
-                                                if let Err(e) = res {
-                                                    eprintln!("Failed to spawn terminal process: {}", e);
-                                                }
-                                            },
-                                        );
-                                        let terminal_box_clone = terminal_box.clone();
-                                        let entry_clone = entry.clone();
-                                        let scroller_clone=scroller.clone();
-
-                                        terminal.connect_child_exited(move |_terminal, _status| {
-                                            terminal_box_clone.set_visible(false);
-                                            entry_clone.set_visible(true);
-                                            scroller_clone.set_visible(true);
-                                        });
-                                    } else {
-                                        let command = exec.split_whitespace().next().unwrap_or("");
-                                        if !command.is_empty() && command != "bash" {
-                                            if let Err(e) = Command::new(command).spawn() {
-                                                eprintln!("Failed to start GUI app: {}", e);
-                                            }
-                                            exit(0);
-                                        } else {
-                                            eprintln!("Invalid or unsupported command in Exec=");
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("No Exec line found");
+                                if line.starts_with("Exec=") {
+                                    exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
                                 }
-                            } else if matches!(*current_mode.borrow(), Mode::Ai) {
-                                entry.set_visible(false);
-                                scroller.set_visible(false);
-                                info_lable.set_visible(false);
-                                aiscroller.set_visible(true);
-                                inpute.grab_focus();
-                                let qs = Rc::new(RefCell::new(String::new()));
-                                let qs_clone = qs.clone();
-                                let inp = inpute.clone();
-                                let rep = reply.clone();
-                                let sr = scroller.clone();
-                                let ent = entry.clone();
-                                let ai = aiscroller.clone();
-                                let info = info_lable.clone();
-                                let clo= alterai_closure.clone();
-                                let aiinfo = aiinfo.clone();
-                                inpute.connect_activate(move |e| {
-                                    aiinfo.set_visible(false);
-                                    let input = e.text().to_string();
-                                    *qs_clone.borrow_mut() = input.clone();
-                                    let qs_later = qs.clone();
-                                    let api_key = read_api_key().to_string();
-                                    let qss = qs_later.borrow();
-                                    if input.starts_with("exit"){
-                                        ent.set_visible(true);
-                                        sr.set_visible(true);
-                                        info.set_visible(true);
-                                        ai.set_visible(false);
-                                    }
-                                    let client = GroqClient::new(api_key.to_string(), None);
-                                    let messages = vec![ChatCompletionMessage {
-                                        role: ChatCompletionRoles::User,
-                                        content: qss.to_string(),
-                                        name: None,
-                                    }];
-                                    let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
-                                    let response = match client.chat_completion(request) {
-                                        Ok(resp) => resp,
-                                        Err(e) => {
-                                            if e.to_string().to_lowercase().contains("network") {
-                                                println!("No internet");
-                                            } else {
-                                                aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
-                                                aiinfo.set_visible(true);
-                                            }
-                                            return;
-                                        }
-                                    };
-                                    rep.set_visible(true);
-                                    ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
-                                    assert!(!response.choices.is_empty());
-                                    inp.set_text("");
-                                });
-                                
-                            } else {
-                                eprintln!("Failed to read .desktop file: {}", path_str);
                             }
+
+                            if let Some(exec) = exec_line {
+                                if terminal_flag {
+                                    entry.set_visible(false);
+                                    scroller.set_visible(false);
+                                    terminal_box.set_visible(true);
+
+                                    let command = &exec;
+                                    let argv = ["sh", "-c", command];
+
+                                    terminal.spawn_async(
+                                        PtyFlags::DEFAULT,
+                                        None,                    // working directory
+                                        &argv,                   // command to run
+                                        &[],                     // environment vars
+                                        SpawnFlags::DEFAULT,
+                                        || {},                   // child setup (no-op)
+                                        -1,                      // timeout (-1 means no timeout)
+                                        None::<&Cancellable>,    // no cancellation
+                                        move |res: Result<Pid, Error>| {
+                                            if let Err(e) = res {
+                                                eprintln!("Failed to spawn terminal process: {}", e);
+                                            }
+                                        },
+                                    );
+                                    let terminal_box_clone = terminal_box.clone();
+                                    let entry_clone = entry.clone();
+                                    let scroller_clone=scroller.clone();
+
+                                    terminal.connect_child_exited(move |_terminal, _status| {
+                                        terminal_box_clone.set_visible(false);
+                                        entry_clone.set_visible(true);
+                                        scroller_clone.set_visible(true);
+                                    });
+                                } else {
+                                    let command = exec.split_whitespace().next().unwrap_or("");
+                                    if !command.is_empty() && command != "bash" {
+                                        if let Err(e) = Command::new(command).spawn() {
+                                            eprintln!("Failed to start GUI app: {}", e);
+                                        }
+                                        exit(0);
+                                    } else {
+                                        eprintln!("Invalid or unsupported command in Exec=");
+                                    }
+                                }
+                            } else {
+                                eprintln!("No Exec line found");
+                            }
+                        } else if matches!(*current_mode.borrow(), Mode::Ai) {
+                            entry.set_visible(false);
+                            scroller.set_visible(false);
+                            info_lable.set_visible(false);
+                            aiscroller.set_visible(true);
+                            inpute.grab_focus();
+                            let qs = Rc::new(RefCell::new(String::new()));
+                            let qs_clone = qs.clone();
+                            let inp = inpute.clone();
+                            let rep = reply.clone();
+                            let sr = scroller.clone();
+                            let ent = entry.clone();
+                            let ai = aiscroller.clone();
+                            let info = info_lable.clone();
+                            let clo= alterai_closure.clone();
+                            let aiinfo = aiinfo.clone();
+                            inpute.connect_activate(move |e| {
+                                aiinfo.set_visible(false);
+                                let input = e.text().to_string();
+                                *qs_clone.borrow_mut() = input.clone();
+                                let qs_later = qs.clone();
+                                let api_key = read_api_key().to_string();
+                                let qss = qs_later.borrow();
+                                if input.starts_with("exit"){
+                                    ent.set_visible(true);
+                                    sr.set_visible(true);
+                                    info.set_visible(true);
+                                    ai.set_visible(false);
+                                }
+                                let client = GroqClient::new(api_key.to_string(), None);
+                                let messages = vec![ChatCompletionMessage {
+                                    role: ChatCompletionRoles::User,
+                                    content: qss.to_string(),
+                                    name: None,
+                                }];
+                                let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
+                                let response = match client.chat_completion(request) {
+                                    Ok(resp) => resp,
+                                    Err(e) => {
+                                        if e.to_string().to_lowercase().contains("network") {
+                                            println!("No internet");
+                                        } else {
+                                            aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
+                                            aiinfo.set_visible(true);
+                                        }
+                                        return;
+                                    }
+                                };
+                                rep.set_visible(true);
+                                ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
+                                assert!(!response.choices.is_empty());
+                                inp.set_text("");
+                            });
+                            
                         } else {
-                            eprintln!("Failed to read application path")
+                            eprintln!("Failed to read .desktop file: {}", path_str);
                         }
-                    
+                    } else {
+                        eprintln!("Failed to read application path")
+                    }
                 }
                 gtk4::gdk::Key::slash => {
                     entry.set_visible(true);
@@ -468,7 +465,7 @@ fn build_ui(app: &Application) {
             glib::Propagation::Stop
         });
     }
-
+    
     {
         let info_lable_revealer = info_lable_revealer.clone();
         scroll_controller.connect_scroll(move |_, _, _| {
