@@ -158,6 +158,7 @@ fn build_ui(app: &Application) {
     let alterai_closure = GtkBox::new(Orientation::Vertical, 12);
     let aiscroller = ScrolledWindow::new();
     let reply = Label::new(Some(""));
+    let aiinfo = Label::new(Some("alterAi has memory loss,\n so it will not be able to remember conversations."));
     aiscroller.set_vexpand(true);
     aiscroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     
@@ -184,6 +185,7 @@ fn build_ui(app: &Application) {
         .build();
     inpute.set_widget_name("aitry");
 
+    alterai_closure.append(&aiinfo);
     alterai_closure.append(&reply);
     alterai_closure.append(&inpute);
     aiscroller.set_child(Some(&alterai_closure));
@@ -381,7 +383,9 @@ fn build_ui(app: &Application) {
                                 let ai = aiscroller.clone();
                                 let info = info_lable.clone();
                                 let clo= alterai_closure.clone();
+                                let aiinfo = aiinfo.clone();
                                 inpute.connect_activate(move |e| {
+                                    aiinfo.set_visible(true);
                                     let input = e.text().to_string();
                                     *qs_clone.borrow_mut() = input.clone();
                                     let qs_later = qs.clone();
@@ -393,6 +397,7 @@ fn build_ui(app: &Application) {
                                         info.set_visible(true);
                                         ai.set_visible(false);
                                     }
+                                    info.set_text("Thinking");
                                     let client = GroqClient::new(api_key.to_string(), None);
                                     let messages = vec![ChatCompletionMessage {
                                         role: ChatCompletionRoles::User,
@@ -401,6 +406,7 @@ fn build_ui(app: &Application) {
                                     }];
                                     let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
                                     let response = client.chat_completion(request).unwrap();
+                                    info.set_visible(false);
                                     rep.set_visible(true);
                                     ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
                                     assert!(!response.choices.is_empty());
@@ -510,7 +516,7 @@ fn build_ui(app: &Application) {
             font-weight: 500;
         }
         #aitry{
-            border-bottom: 1px solid rgba(73, 73, 73, 0.59);
+            border-top: 1px solid rgba(139, 139, 139, 0.59);
             padding: 10px;
             padding-left: 15px;
             border-bottom-right-radius: 12px;
