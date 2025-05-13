@@ -16,6 +16,7 @@ use vte4::PtyFlags;
 use std::path::Path;
 use chrono::{Local, DateTime};
 use groq_api_rust::{GroqClient, ChatCompletionRequest, ChatCompletionRoles, ChatCompletionMessage};
+
 fn main() {
     let app = Application::builder()
         .application_id("ekah.scu.moss")
@@ -405,7 +406,7 @@ fn build_ui(app: &Application) {
                                     let qs_later = qs.clone();
                                     let api_key = read_api_key().to_string();
                                     let qss = qs_later.borrow();
-                                    if qss.starts_with("exit"){
+                                    if input.starts_with("exit"){
                                         ent.set_visible(true);
                                         sr.set_visible(true);
                                         info.set_visible(true);
@@ -418,7 +419,18 @@ fn build_ui(app: &Application) {
                                         name: None,
                                     }];
                                     let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
-                                    let response = client.chat_completion(request).unwrap();
+                                    let response = match client.chat_completion(request) {
+                                        Ok(resp) => resp,
+                                        Err(e) => {
+                                            if e.to_string().to_lowercase().contains("network") {
+                                                println!("No internet");
+                                            } else {
+                                                aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
+                                                aiinfo.set_visible(true);
+                                            }
+                                            return;
+                                        }
+                                    };
                                     rep.set_visible(true);
                                     ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
                                     assert!(!response.choices.is_empty());
@@ -470,7 +482,7 @@ fn build_ui(app: &Application) {
     let css = r#"
         window {
             background-color: rgba(20, 37, 27, 0.6);
-            border-radius: 12px;
+            border-radius: 13px;
             border-style: solid;
             border-width: 2px ;
             border-color: rgba(73, 73, 73, 0.59);
