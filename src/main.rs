@@ -15,19 +15,28 @@ use vte4::Terminal;
 use vte4::PtyFlags;
 use std::path::Path;
 use chrono::{Local, DateTime};
-use groq_api_rust::{GroqClient, ChatCompletionRequest, ChatCompletionRoles, ChatCompletionMessage};
+use groq_api_rust::{AsyncGroqClient, ChatCompletionRequest, ChatCompletionRoles, ChatCompletionMessage};
+use tokio::runtime::Runtime;
 
-fn main() {
+async fn run_gtk_app() {
+    // Your GTK setup code here (including async Groq API calls)
     let app = Application::builder()
         .application_id("ekah.scu.moss")
         .build();
 
     app.connect_activate(build_ui);
-    // Command::new("bash").arg("-c").arg("cd").arg("~/");
+
     app.run();
 }
 
+fn main() {
+    let rt = Runtime::new().unwrap();
+    // Command::new("bash").arg("-c").arg("cd").arg("~/");
+    rt.block_on(run_gtk_app());
+}
+
 #[derive(Clone, PartialEq)]
+
 enum Mode {
     App,
     Notes,
@@ -155,12 +164,12 @@ fn build_ui(app: &Application) {
     terminal_box.append(&terminal);
     terminal_box.set_visible(false);
 
+    let alterai = GtkBox::new(Orientation::Vertical, 12);
     let alterai_closure = GtkBox::new(Orientation::Vertical, 12);
     let aiscroller = ScrolledWindow::new();
     aiscroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Never);
     aiscroller.add_css_class("no");
-    let reply = Label::new(Some(""));
-    let aiinfo = Label::new(Some(" alterAi has memory loss,\n so it will not be able to remember conversations."));
+    let aiinfo = Label::new(Some("  alterAi has volatile memory,\n so it will forget your conversations when the application is closed"));
     let dummy = GtkBox::new(Orientation::Vertical, 0);
     dummy.set_vexpand(true);
 
@@ -180,25 +189,15 @@ fn build_ui(app: &Application) {
     alterai_closure.set_margin_bottom(10);
     alterai_closure.set_vexpand(false);
 
-    reply.set_widget_name("ai_reply");
-    reply.set_wrap(true);
-    reply.set_max_width_chars(50);
-    reply.set_xalign(0.0);
-    reply.set_margin_start(20);
-    reply.set_margin_end(20);
-    reply.set_margin_top(20);
-    reply.set_margin_bottom(20);
-    reply.set_visible(false);
-
     let inpute = Entry::builder()
         .placeholder_text(" ask alterAi")
         .hexpand(true)
         .build();
     inpute.set_widget_name("aitry");
 
-    alterai_closure.append(&dummy);
-    alterai_closure.append(&aiinfo);
-    alterai_closure.append(&reply);
+    alterai.append(&dummy);
+    alterai.append(&aiinfo);
+    alterai_closure.append(&alterai);
     alterai_closure.append(&inpute);
     aiscroller.set_child(Some(&alterai_closure));
     aiscroller.set_visible(false);
@@ -330,13 +329,13 @@ fn build_ui(app: &Application) {
 
                                     terminal.spawn_async(
                                         PtyFlags::DEFAULT,
-                                        None,                    // working directory
-                                        &argv,                   // command to run
-                                        &[],                     // environment vars
+                                        None,      
+                                        &argv,            
+                                        &[],            
                                         SpawnFlags::DEFAULT,
-                                        || {},                   // child setup (no-op)
-                                        -1,                      // timeout (-1 means no timeout)
-                                        None::<&Cancellable>,    // no cancellation
+                                        || {},               
+                                        -1,                      
+                                        None::<&Cancellable>,  
                                         move |res: Result<Pid, Error>| {
                                             if let Err(e) = res {
                                                 eprintln!("Failed to spawn terminal process: {}", e);
@@ -366,58 +365,99 @@ fn build_ui(app: &Application) {
                             } else {
                                 eprintln!("No Exec line found");
                             }
-                        } else if matches!(*current_mode.borrow(), Mode::Ai) {
+                        } else if matches!(*current_mode.borrow(), Mode::Ai) {  
                             entry.set_visible(false);
                             scroller.set_visible(false);
                             info_lable.set_visible(false);
                             aiscroller.set_visible(true);
                             inpute.grab_focus();
-                            let qs = Rc::new(RefCell::new(String::new()));
+                            let chat_history: Rc<RefCell<Vec<ChatCompletionMessage>>> = Rc::new(RefCell::new(vec![]));
                             let inp = inpute.clone();
-                            let rep = reply.clone();
                             let sr = scroller.clone();
                             let ent = entry.clone();
                             let ai = aiscroller.clone();
                             let info = info_lable.clone();
                             let clo= alterai_closure.clone();
+                            let aiclo = alterai.clone();
                             let aiinfo = aiinfo.clone();
+                            
                             inpute.connect_activate(move |e| {
-                                aiinfo.set_visible(false);
                                 let input = e.text().to_string();
-                                let qs_later = qs.clone();
+                                let history = chat_history.clone();
                                 let api_key = read_api_key().to_string();
-                                let qss = qs_later.borrow();
-                                if input.starts_with("exit"){
+                                if input == "exit"{
                                     ent.set_visible(true);
                                     sr.set_visible(true);
                                     info.set_visible(true);
                                     ai.set_visible(false);
-                                }
-                                let client = GroqClient::new(api_key.to_string(), None);
-                                let messages = vec![ChatCompletionMessage {
+                                } else {
+                                    history.borrow_mut().push(ChatCompletionMessage {
                                     role: ChatCompletionRoles::User,
-                                    content: qss.to_string(),
+                                    content: input.clone(),
                                     name: None,
-                                }];
-                                let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
-                                let response = match client.chat_completion(request) {
-                                    Ok(resp) => resp,
-                                    Err(e) => {
-                                        if e.to_string().to_lowercase().contains("network") {
-                                            println!("No internet");
-                                        } else {
-                                            aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
-                                            aiinfo.set_visible(true);
+                                    });
+
+                                    let airep = Label::new(Some(""));
+                                    airep.set_wrap(true);
+                                    airep.set_max_width_chars(80);
+                                    airep.set_halign(gtk4::Align::Start);
+                                    airep.set_margin_start(20);
+                                    airep.set_margin_end(100);
+                                    airep.set_margin_top(0);
+                                    airep.set_margin_bottom(10);
+                                    airep.set_widget_name("ai_reply");
+                                    
+
+                                    let user_inp = Label::new(Some(""));
+                                    user_inp.set_wrap(true);
+                                    user_inp.set_max_width_chars(50);
+                                    user_inp.set_halign(gtk4::Align::End);
+                                    user_inp.set_margin_start(100);
+                                    user_inp.set_margin_end(20);
+                                    user_inp.set_margin_top(0);
+                                    user_inp.set_margin_bottom(10);
+                                    user_inp.set_widget_name("user_inp");
+                                    user_inp.set_text(&input);
+
+                                    aiclo.append(&user_inp);
+                                    aiclo.append(&airep);
+                                    
+                                    let clo = clo.clone();
+                                    let ai = ai.clone();
+                                    let inp = inp.clone();
+                                    let aiinfo = aiinfo.clone();
+                                    let aiclo = aiclo.clone();
+                                    glib::MainContext::default().spawn_local(async move {
+                                        let messages = history.borrow().clone();
+                                        let client = AsyncGroqClient::new(api_key, None).await;
+                                        let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
+
+                                        match client.chat_completion(request).await {
+                                            Ok(response) => {
+                                                let ai_reply = &response.choices[0].message.content;
+
+                                                history.borrow_mut().push(ChatCompletionMessage {
+                                                    role: ChatCompletionRoles::Assistant,
+                                                    content: ai_reply.clone(),
+                                                    name: None,
+                                                });
+
+                                                ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
+                                                // println!("Response: {}", ai_reply);
+
+                                            }
+                                            Err(err) => {
+                                                eprintln!("AI error: {}", err);
+                                                aiclo.remove(&user_inp);
+                                                aiclo.remove(&airep);
+                                                aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
+                                                aiinfo.set_visible(true);
+                                            }
                                         }
-                                        return;
-                                    }
-                                };
-                                rep.set_visible(true);
-                                ai_typing_effect(&rep, &strip_markdown_symbols(&response.choices[0].message.content), 5, &ai,&clo);
-                                assert!(!response.choices.is_empty());
-                                inp.set_text("");
+                                        inp.set_text("");
+                                    });
+                                }
                             });
-                            
                         } else {
                             eprintln!("Failed to read .desktop file: {}", path_str);
                         }
@@ -503,6 +543,15 @@ fn build_ui(app: &Application) {
             border: 0.5px solid rgba(139, 139, 139, 0.59);
         }
         #ai_reply {
+            background-color: rgba(0, 107, 18, 0.14);
+            padding: 10px;
+            border-radius: 18px;
+            font-size: 16px;
+            border: 0.5px solid rgba(217, 255, 208, 0.59);
+            font-family: "Cantarell";
+            font-weight: 500;
+        }
+        #user_inp {
             background-color: rgba(139, 139, 139, 0.14);
             padding: 10px;
             border-radius: 18px;
@@ -561,7 +610,7 @@ fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
         return (
             Mode::Ai,
             vec![
-                format!("Ask alterAi."),
+                format!("Enter chat"),
             ],
             vec![
                 input.to_string()

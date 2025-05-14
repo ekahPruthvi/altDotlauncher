@@ -13,4 +13,5 @@ fuzzy-matcher = "0.3.7"
 glob = "0.3.2"
 groq-api-rust = "0.2.51"
 gtk4 = "0.9.6"
+tokio = { version = "1.45.0", features = ["full"] }
 vte4 = "0.8.0"
