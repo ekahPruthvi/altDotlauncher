@@ -201,7 +201,6 @@ fn build_ui(app: &Application) {
     alterai_closure.append(&inpute);
     aiscroller.set_child(Some(&alterai_closure));
     aiscroller.set_visible(false);
-
     let vbox_inner = GtkBox::new(Orientation::Vertical, 12);
     let scroller = ScrolledWindow::new();
     scroller.set_vexpand(true);
@@ -248,6 +247,28 @@ fn build_ui(app: &Application) {
                 let now: DateTime<Local> = Local::now();
                 let datetime_am_pm = now.format(" %B %e,\n%l:%M %P").to_string();
                 info.set_text(&datetime_am_pm);
+                _res_flag = true;
+            } else if text_in_entry == "~b"{
+                let bat = format!("/sys/class/power_supply/BAT1/capacity");
+                let path= Path::new(&bat);
+                if path.exists(){
+                    let cap = fs::read_to_string(bat)
+                    .expect("Failed to read battery capacity")
+                    .trim().to_string();
+                    let n:u64=cap.parse().unwrap();
+                    if n > 80 {
+                        info.set_markup(&format!("Battery capacity, {}%\n<i>\"At battery nirvana.\"</i>",cap));
+                        info.set_widget_name("batg");
+                    } else if n < 80 && n > 50 {
+                        info.set_markup(&format!("Battery capacity, {}%\n<i>\"In power harmony.\"</i>",cap));
+                        info.set_widget_name("batg");
+                    } else if n < 50 && n > 20 {
+                        info.set_markup(&format!("Battery capacity, {}%\n<i>\"The border of zone efficiency.\"</i>",cap));
+                    } else {
+                        info.set_markup(&format!("Battery capacity, {}%\n<i>\"Depleted juice.\"</i>",cap));
+                        info.set_widget_name("batb");
+                    }
+                }
                 _res_flag = true;
             } else if text_in_entry == "!"{
                 info.set_text("");
@@ -441,9 +462,9 @@ fn build_ui(app: &Application) {
                                                     content: ai_reply.clone(),
                                                     name: None,
                                                 });
-
+                                                
                                                 ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
-                                                // println!("Response: {}", ai_reply);
+                                                //println!("Response: {}", ai_reply);
 
                                             }
                                             Err(err) => {
@@ -508,6 +529,24 @@ fn build_ui(app: &Application) {
             font-family: "Adwaita Sans";
             font-weight: 700;
         }
+        #batg {
+            background-color: rgba(117, 197, 121, 0.21);
+            padding: 100px;
+            border-radius: 12px;
+            font-size: 40px;
+            border: 0.5px solid rgba(139, 139, 139, 0.59);
+            font-family: "Adwaita Sans";
+            font-weight: 700;
+        }
+        #batb {
+            background-color: rgba(243, 129, 129, 0.14);
+            padding: 100px;
+            border-radius: 12px;
+            font-size: 40px;
+            border: 0.5px solid rgba(139, 139, 139, 0.59);
+            font-family: "Adwaita Sans";
+            font-weight: 700;
+        }
         entry {
             border-bottom: 1px solid rgba(73, 73, 73, 0.59);
             padding: 10px;
@@ -543,7 +582,7 @@ fn build_ui(app: &Application) {
             border: 0.5px solid rgba(139, 139, 139, 0.59);
         }
         #ai_reply {
-            background-color: rgba(0, 107, 18, 0.14);
+            background-color: rgba(1, 78, 14, 0.27);
             padding: 10px;
             border-radius: 18px;
             font-size: 16px;
@@ -557,8 +596,9 @@ fn build_ui(app: &Application) {
             border-radius: 18px;
             font-size: 16px;
             border: 0.5px solid rgba(139, 139, 139, 0.59);
+            box-shadow: 0px 0px 5px rgba(0, 0, 0, 0.26);
             font-family: "Cantarell";
-            font-weight: 500;
+            font-weight: 600;
         }
         #aitry{
             border-top: 0.5px solid rgba(139, 139, 139, 0.59);
