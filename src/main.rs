@@ -386,99 +386,230 @@ fn build_ui(app: &Application) {
                             } else {
                                 eprintln!("No Exec line found");
                             }
-                        } else if matches!(*current_mode.borrow(), Mode::Ai) {  
-                            entry.set_visible(false);
-                            scroller.set_visible(false);
-                            info_lable.set_visible(false);
-                            aiscroller.set_visible(true);
-                            inpute.grab_focus();
-                            let chat_history: Rc<RefCell<Vec<ChatCompletionMessage>>> = Rc::new(RefCell::new(vec![]));
-                            let inp = inpute.clone();
-                            let sr = scroller.clone();
-                            let ent = entry.clone();
-                            let ai = aiscroller.clone();
-                            let info = info_lable.clone();
-                            let clo= alterai_closure.clone();
-                            let aiclo = alterai.clone();
-                            let aiinfo = aiinfo.clone();
-                            
-                            inpute.connect_activate(move |e| {
-                                let input = e.text().to_string();
-                                let history = chat_history.clone();
-                                let api_key = read_api_key().to_string();
-                                if input == "exit"{
-                                    ent.set_visible(true);
-                                    sr.set_visible(true);
-                                    info.set_visible(true);
-                                    ai.set_visible(false);
-                                } else {
-                                    history.borrow_mut().push(ChatCompletionMessage {
-                                    role: ChatCompletionRoles::User,
-                                    content: input.clone(),
-                                    name: None,
-                                    });
+                        } else if matches!(*current_mode.borrow(), Mode::Ai) && !aiscroller.get_visible() {
+                            if entry.text() == "!!"{
+                                entry.set_visible(false);
+                                scroller.set_visible(false);
+                                terminal_box.set_visible(true);
 
-                                    let airep = Label::new(Some(""));
-                                    airep.set_wrap(true);
-                                    airep.set_max_width_chars(80);
-                                    airep.set_halign(gtk4::Align::Start);
-                                    airep.set_margin_start(20);
-                                    airep.set_margin_end(100);
-                                    airep.set_margin_top(0);
-                                    airep.set_margin_bottom(10);
-                                    airep.set_widget_name("ai_reply");
-                                    
+                                let space = r#"
+                                    #!/bin/bash
 
-                                    let user_inp = Label::new(Some(""));
-                                    user_inp.set_wrap(true);
-                                    user_inp.set_max_width_chars(50);
-                                    user_inp.set_halign(gtk4::Align::End);
-                                    user_inp.set_margin_start(100);
-                                    user_inp.set_margin_end(20);
-                                    user_inp.set_margin_top(0);
-                                    user_inp.set_margin_bottom(10);
-                                    user_inp.set_widget_name("user_inp");
-                                    user_inp.set_text(&input);
+                                    # Terminal size
 
-                                    aiclo.append(&user_inp);
-                                    aiclo.append(&airep);
-                                    
-                                    let clo = clo.clone();
-                                    let ai = ai.clone();
-                                    let inp = inp.clone();
-                                    let aiinfo = aiinfo.clone();
-                                    let aiclo = aiclo.clone();
-                                    glib::MainContext::default().spawn_local(async move {
-                                        let messages = history.borrow().clone();
-                                        let client = AsyncGroqClient::new(api_key, None).await;
-                                        let request = ChatCompletionRequest::new("llama3-70b-8192", messages);
+                                    sleep 1s
+                                    cols=$(tput cols)
+                                    rows=$(tput lines)
 
-                                        match client.chat_completion(request).await {
-                                            Ok(response) => {
-                                                let ai_reply = &response.choices[0].message.content;
+                                    center_x=$((cols / 2))
+                                    center_y=$((rows / 2))
 
-                                                history.borrow_mut().push(ChatCompletionMessage {
-                                                    role: ChatCompletionRoles::Assistant,
-                                                    content: ai_reply.clone(),
-                                                    name: None,
-                                                });
-                                                
-                                                ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
-                                                //println!("Response: {}", ai_reply);
+                                    # Number of stars
+                                    num_stars=200
 
-                                            }
-                                            Err(err) => {
-                                                eprintln!("AI error: {}", err);
-                                                aiclo.remove(&user_inp);
-                                                aiclo.remove(&airep);
-                                                aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
-                                                aiinfo.set_visible(true);
-                                            }
+                                    # Each star has a position and speed
+                                    declare -a stars_x
+                                    declare -a stars_y
+                                    declare -a stars_z
+
+                                    max_depth=20
+
+                                    # Initialize stars with random positions in 3D space
+                                    for ((i=0; i<num_stars; i++)); do
+                                    stars_x[i]=$(( RANDOM % (cols) - center_x ))
+                                    stars_y[i]=$(( RANDOM % (rows) - center_y ))
+                                    stars_z[i]=$(( RANDOM % max_depth + 1 ))
+                                    done
+
+                                    # Hide cursor
+                                    tput civis
+
+                                    clear
+
+                                    while true; do
+                                    # Clear screen buffer as associative array to store characters by coords
+                                    declare -A screen=()
+
+                                    for ((i=0; i<num_stars; i++)); do
+                                        # Move star closer (simulate flying forward)
+                                        (( stars_z[i]-- ))
+
+                                        # Reset star when it passes you
+                                        if (( stars_z[i] <= 0 )); then
+                                        stars_x[i]=$(( RANDOM % (cols) - center_x ))
+                                        stars_y[i]=$(( RANDOM % (rows) - center_y ))
+                                        stars_z[i]=$max_depth
+                                        fi
+
+                                        # Project 3D point to 2D screen (simple perspective projection)
+                                        sx=$(( center_x + stars_x[i] * max_depth / stars_z[i] ))
+                                        sy=$(( center_y + stars_y[i] * max_depth / stars_z[i] ))
+
+                                        # Check if projected point is inside screen
+                                        if (( sx >= 0 && sx < cols && sy >= 0 && sy < rows )); then
+                                        # Star brightness depends on depth (closer stars are brighter)
+                                        brightness=$(( (max_depth - stars_z[i]) * 3 / max_depth ))
+
+                                        # Choose star char by brightness
+                                        case $brightness in
+                                            0) char='.' ;;
+                                            1) char='*' ;;
+                                            2) char='o' ;;
+                                            3) char='@' ;;
+                                            *) char='.' ;;
+                                        esac
+
+                                        screen["$sy,$sx"]=$char
+                                        fi
+                                    done
+
+                                    # Render frame
+                                    clear
+                                    for ((y=0; y<rows; y++)); do
+                                        line=""
+                                        for ((x=0; x<cols; x++)); do
+                                        if [[ -n "${screen[$y,$x]}" ]]; then
+                                            line+=${screen[$y,$x]}
+                                        else
+                                            line+=" "
+                                        fi
+                                        done
+                                        echo "$line"
+                                    done
+
+                                    # Frame delay
+                                    sleep 0.03
+                                    done
+
+                                    # Show cursor on exit
+                                    trap "tput cnorm; clear; exit" SIGINT SIGTERM
+
+                                "#;
+
+                                let command = &space;
+                                let argv = ["sh", "-c", command];
+
+                                terminal.spawn_async(
+                                    PtyFlags::DEFAULT,
+                                    None,      
+                                    &argv,            
+                                    &[],            
+                                    SpawnFlags::DEFAULT,
+                                    || {},               
+                                    -1,                      
+                                    None::<&Cancellable>,  
+                                    move |res: Result<Pid, Error>| {
+                                        if let Err(e) = res {
+                                            eprintln!("Failed to spawn terminal process: {}", e);
                                         }
-                                        inp.set_text("");
-                                    });
-                                }
-                            });
+                                    },
+                                );
+                                let terminal_box_clone = terminal_box.clone();
+                                let entry_clone = entry.clone();
+                                let scroller_clone=scroller.clone();
+
+                                terminal.connect_child_exited(move |_terminal, _status| {
+                                    terminal_box_clone.set_visible(false);
+                                    entry_clone.set_visible(true);
+                                    scroller_clone.set_visible(true);
+                                });
+                            } else {
+                                entry.set_visible(false);
+                                scroller.set_visible(false);
+                                info_lable.set_visible(false);
+                                aiscroller.set_visible(true);
+                                inpute.grab_focus();
+                                let chat_history: Rc<RefCell<Vec<ChatCompletionMessage>>> = Rc::new(RefCell::new(vec![]));
+                                let inp = inpute.clone();
+                                let sr = scroller.clone();
+                                let ent = entry.clone();
+                                let ai = aiscroller.clone();
+                                let info = info_lable.clone();
+                                let clo= alterai_closure.clone();
+                                let aiclo = alterai.clone();
+                                let aiinfo = aiinfo.clone();
+                                
+                                inpute.connect_activate(move |e| {
+                                    let input = e.text().to_string();
+                                    let history = chat_history.clone();
+                                    let api_key = read_api_key().to_string();
+                                    if input == "exit"{
+                                        ent.set_visible(true);
+                                        sr.set_visible(true);
+                                        info.set_visible(true);
+                                        ai.set_visible(false);
+                                    } else {
+                                        history.borrow_mut().push(ChatCompletionMessage {
+                                            role: ChatCompletionRoles::User,
+                                            content: input.clone(),
+                                            name: None,
+                                        });
+
+                                        let airep = Label::new(Some(""));
+                                        airep.set_wrap(true);
+                                        airep.set_max_width_chars(80);
+                                        airep.set_halign(gtk4::Align::Start);
+                                        airep.set_margin_start(20);
+                                        airep.set_margin_end(100);
+                                        airep.set_margin_top(0);
+                                        airep.set_margin_bottom(10);
+                                        airep.set_selectable(true);
+                                        airep.set_widget_name("ai_reply");
+                                        
+
+                                        let user_inp = Label::new(Some(""));
+                                        user_inp.set_wrap(true);
+                                        user_inp.set_max_width_chars(50);
+                                        user_inp.set_halign(gtk4::Align::End);
+                                        user_inp.set_margin_start(100);
+                                        user_inp.set_margin_end(20);
+                                        user_inp.set_margin_top(0);
+                                        user_inp.set_margin_bottom(10);
+                                        user_inp.set_widget_name("user_inp");
+                                        user_inp.set_text(&input);
+
+                                        aiclo.append(&user_inp);
+                                        aiclo.append(&airep);
+                                        
+                                        let clo = clo.clone();
+                                        let ai = ai.clone();
+                                        let inp = inp.clone();
+                                        let aiinfo = aiinfo.clone();
+                                        let aiclo = aiclo.clone();
+                                        glib::MainContext::default().spawn_local(async move {
+                                            let messages = history.borrow().clone();
+                                            let client = AsyncGroqClient::new(api_key, None).await;
+                                            let request = ChatCompletionRequest::new("llama-3.3-70b-versatile", messages);
+
+                                            match client.chat_completion(request).await {
+                                                Ok(response) => {
+                                                    let ai_reply = &response.choices[0].message.content;
+
+                                                    history.borrow_mut().push(ChatCompletionMessage {
+                                                        role: ChatCompletionRoles::Assistant,
+                                                        content: ai_reply.clone(),
+                                                        name: None,
+                                                    });
+                                                    
+                                                    ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
+                                                    // println!("Response: {}", ai_reply);
+
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("AI error: {}", err);
+                                                    aiclo.remove(&user_inp);
+                                                    aiclo.remove(&airep);
+                                                    aiinfo.set_markup("Err:<i>404</i>\nconnection could not be Established");
+                                                    let vadj = ai.vadjustment();
+                                                    vadj.set_value(vadj.lower());
+                                                    aiinfo.set_visible(true);
+                                                }
+                                            }
+                                            inp.set_text("");
+                                        });
+                                    }
+                                });
+                            }
                         } else {
                             eprintln!("Failed to read .desktop file: {}", path_str);
                         }
