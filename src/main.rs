@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable,
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -17,6 +17,9 @@ use std::path::Path;
 use chrono::{Local, DateTime};
 use groq_api_rust::{AsyncGroqClient, ChatCompletionRequest, ChatCompletionRoles, ChatCompletionMessage};
 use tokio::runtime::Runtime;
+use std::cell::Cell;
+use std::fs::{create_dir_all, write, OpenOptions};
+use std::io::Write;
 
 async fn run_gtk_app() {
     // Your GTK setup code here (including async Groq API calls)
@@ -32,6 +35,7 @@ async fn run_gtk_app() {
 fn main() {
     let rt = Runtime::new().unwrap();
     // Command::new("bash").arg("-c").arg("cd").arg("~/");
+    
     rt.block_on(run_gtk_app());
 }
 
@@ -108,6 +112,140 @@ fn strip_markdown_symbols(text: &str) -> String {
         .replace("__", "")
         .replace("*", "")
         .replace("`", "")
+}
+
+fn torq_marker(notescroller: &ScrolledWindow) {
+    const NOTES_PATH: &str = "/home/ekah/Documents/pipe/src/markers/notes.algae";
+
+    notescroller.set_hexpand(true);
+    notescroller.set_vexpand(true);
+    notescroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    
+    
+    let tag_table = TextTagTable::new();
+    let buffer = TextBuffer::new(Some(&tag_table));
+    let text_view = TextView::with_buffer(&buffer);
+    text_view.set_editable(true);
+    text_view.set_monospace(true);
+    text_view.set_wrap_mode(gtk4::WrapMode::WordChar);
+    text_view.set_justification(gtk4::Justification::Fill);
+    text_view.style_context().add_class("textview-style");
+    text_view.set_hexpand(true);
+    text_view.set_vexpand(true);
+    text_view.set_margin_bottom(5);
+    text_view.set_margin_top(5);
+    text_view.set_margin_start(5);
+    text_view.set_margin_end(5);
+    notescroller.set_child(Some(&text_view));
+
+    let tag_large = TextTag::builder()
+        .name("large")
+        .scale(gtk4::pango::SCALE_LARGE)
+        .weight(900)
+        .font("FreeMono Bold 20")
+        .build();
+
+    let tag_hidden = TextTag::builder()
+        .name("hidden")
+        .invisible(true)
+        .build();
+
+    let tag_code_prefix = TextTag::builder()
+        .name("codeprefix")
+        .background("rgba(153, 255, 158, 0.55)")
+        .font("FreeMono 17")
+        .weight(200)
+        .build();
+
+    buffer.tag_table().add(&tag_large);
+    buffer.tag_table().add(&tag_hidden);
+    buffer.tag_table().add(&tag_code_prefix);
+
+    if let Ok(content) = std::fs::read_to_string(NOTES_PATH) {
+        buffer.set_text(&content);
+    }
+
+    let buffer_rc = Rc::new(buffer);
+    let is_formatting = Rc::new(Cell::new(false));
+    // -- Define reusable formatting function
+    let apply_formatting = {
+        let buffer = buffer_rc.clone();
+        let is_formatting = is_formatting.clone();
+
+        move || {
+            if is_formatting.get() {
+                return;
+            }
+            is_formatting.set(true);
+
+            buffer.remove_all_tags(&buffer.start_iter(), &buffer.end_iter());
+
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .as_str()
+                .to_string();
+
+            let mut offset: i32 = 0;
+            let mut inside_hash = false;
+            let mut inside_code = false;
+
+            for line in text.lines() {
+                let line_len = line.len() as i32;
+                let start = buffer.iter_at_offset(offset);
+                let end = buffer.iter_at_offset(offset + line_len);
+
+                if line.trim() == "#" {
+                    inside_hash = !inside_hash;
+                    if let Some(tag) = buffer.tag_table().lookup("hidden") {
+                        buffer.apply_tag(&tag, &start, &end);
+                    }
+                } else if line.starts_with(">") {
+                    inside_code = !inside_code;
+                    if let Some(tag) = buffer.tag_table().lookup("hidden") {
+                        let mut char_end = start.clone();
+                        char_end.forward_char();
+                        buffer.apply_tag(&tag, &start, &char_end);
+                    }
+                } else if inside_code {
+                    if let Some(tag) = buffer.tag_table().lookup("codeprefix") {
+                        buffer.apply_tag(&tag, &start, &end);
+                    }
+                } else if inside_hash {
+                    if let Some(tag) = buffer.tag_table().lookup("large") {
+                        buffer.apply_tag(&tag, &start, &end);
+                    }
+                }
+
+                offset += line_len + 1;
+            }
+
+            // Autosave
+            let _ = create_dir_all("./markers");
+            let _ = write(NOTES_PATH, &text);
+
+            is_formatting.set(false);
+        }
+    };
+
+    // -- Connect signal
+    {
+        let apply_formatting_clone = apply_formatting.clone();
+        buffer_rc.connect_changed(move |_| {
+            apply_formatting_clone();
+        });
+    }
+
+    let buffer = buffer_rc.clone();
+    buffer.connect_mark_set(move |_buffer, iter, mark| {
+        if mark.name() == Some("insert".into()) {
+            let mut iter = iter.clone();
+            text_view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
+        }
+    });
+    // -- Trigger formatting immediately
+    apply_formatting();
+
+
 }
 
 fn build_ui(app: &Application) {
@@ -201,17 +339,26 @@ fn build_ui(app: &Application) {
     alterai_closure.append(&inpute);
     aiscroller.set_child(Some(&alterai_closure));
     aiscroller.set_visible(false);
+
     let vbox_inner = GtkBox::new(Orientation::Vertical, 12);
     let scroller = ScrolledWindow::new();
     scroller.set_vexpand(true);
     scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     scroller.set_child(Some(&vbox_inner));
 
+    let notescroller = ScrolledWindow::new();
+    notescroller.set_size_request(400, 800);
+    notescroller.set_vexpand(true);
+    notescroller.set_hexpand(true);
+    notescroller.add_css_class("no");
+    notescroller.set_visible(false);
+
     vbox.append(&entry);
     vbox.append(&info_lable_revealer);
     vbox.append(&scroller);
     vbox.append(&terminal_box);
     vbox.append(&aiscroller);
+    vbox.append(&notescroller);
     window.set_child(Some(&vbox));
 
     let info_lable_revealer = Rc::new(info_lable_revealer);
@@ -533,11 +680,37 @@ fn build_ui(app: &Application) {
                                     let input = e.text().to_string();
                                     let history = chat_history.clone();
                                     let api_key = read_api_key().to_string();
-                                    if input == "exit"{
+                                    if input.to_lowercase() == "/e"{
                                         ent.set_visible(true);
                                         sr.set_visible(true);
                                         info.set_visible(true);
                                         ai.set_visible(false);
+                                    } else if input.to_lowercase() == "/s" {
+                                        if let Some(last) = chat_history.borrow().last() {
+                                            let mut make_a_note = OpenOptions::new()
+                                                .create(true)        // Create the file if it doesn't exist
+                                                .append(true)        // Append to the end of the file
+                                                .open("/home/ekah/Documents/pipe/src/markers/notes.algae")
+                                                .expect("Failed to open file");
+
+                                            let now: DateTime<Local> = Local::now();
+                                            let datetime_am_pm = now.format("%B %e, %l:%M %P").to_string();
+                                            let line="_".repeat(50);
+                                            make_a_note
+                                                .write_all(format!("\n{}\n>\n alterAi \n>\n{}\n\n{}\n{}\n",line, datetime_am_pm, strip_markdown_symbols(&last.content), line).as_bytes())
+                                                .expect("Failed to write to file");
+
+                                            //println!("Saved:\n{}", last.content);
+                                            inp.set_text("");
+                                            let save_message = Label::new(Some("Saved Previous reply"));
+                                            save_message.set_widget_name("save_info");
+                                            save_message.set_max_width_chars(20);
+                                            save_message.set_halign(gtk4::Align::Center);
+                                            aiclo.append(&save_message);
+
+                                            let vadj = ai.vadjustment();
+                                            vadj.set_value(vadj.lower());
+                                        }
                                     } else {
                                         history.borrow_mut().push(ChatCompletionMessage {
                                             role: ChatCompletionRoles::User,
@@ -591,6 +764,7 @@ fn build_ui(app: &Application) {
                                                         name: None,
                                                     });
                                                     
+
                                                     ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
                                                     // println!("Response: {}", ai_reply);
 
@@ -610,6 +784,12 @@ fn build_ui(app: &Application) {
                                     }
                                 });
                             }
+                        } else if matches!(*current_mode.borrow(), Mode::Notes) {
+                            entry.set_visible(false);
+                            scroller.set_visible(false);
+                            info_lable.set_visible(false);
+                            notescroller.set_visible(true);
+                            torq_marker(&notescroller);
                         } else {
                             eprintln!("Failed to read .desktop file: {}", path_str);
                         }
@@ -650,6 +830,17 @@ fn build_ui(app: &Application) {
             border-style: solid;
             border-width: 2px ;
             border-color: rgba(73, 73, 73, 0.59);
+        }
+        .textview-style {
+            border-radius: 13px;
+            padding: 100px;
+            background-color: rgb(117, 197, 121);
+            color: black;
+            font-size: 16px;
+            letter-spacing: 6px;
+        }
+        .textview-style text {
+            background-color: rgb(117, 197, 121);
         }
         #info_lable-card {
             background-color: rgba(139, 139, 139, 0.14);
@@ -731,6 +922,12 @@ fn build_ui(app: &Application) {
             font-family: "Cantarell";
             font-weight: 600;
         }
+        #save_info {
+            padding: 10px;
+            font-size: 12px;
+            font-family: "Cantarell";
+            font-weight: 200;
+        }
         #aitry{
             border-top: 0.5px solid rgba(139, 139, 139, 0.59);
             padding: 10px;
@@ -774,7 +971,7 @@ fn build_ui(app: &Application) {
 
 fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
     if input.starts_with('`') {
-        return (Mode::Notes, Vec::new(), Vec::new());
+        return (Mode::Notes, vec![format!("Open Marker")], vec![input.to_string()]);
     }
 
     if input.starts_with('!') {
