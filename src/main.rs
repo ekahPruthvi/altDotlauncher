@@ -220,7 +220,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
             }
 
             // Autosave
-            let _ = create_dir_all("./markers");
+            let _ = create_dir_all("/home/ekah/Documents/pipe/src/markers/");
             let _ = write(NOTES_PATH, &text);
 
             is_formatting.set(false);
