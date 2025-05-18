@@ -244,7 +244,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
     });
     // -- Trigger formatting immediately
     apply_formatting();
-
+    
 
 }
 
@@ -257,7 +257,7 @@ fn build_ui(app: &Application) {
         .resizable(false)
         .decorated(false)
         .build();
-
+    let window1 = window.clone();
     let event_controller = gtk4::EventControllerKey::new();
     window.add_controller(event_controller.clone());
 
@@ -416,6 +416,9 @@ fn build_ui(app: &Application) {
                         info.set_widget_name("batb");
                     }
                 }
+                _res_flag = true;
+            } else if text_in_entry == "`"{ 
+                info.set_text("open Marker\nThe mossy notes");
                 _res_flag = true;
             } else if text_in_entry == "!"{
                 info.set_text("");
@@ -790,6 +793,7 @@ fn build_ui(app: &Application) {
                             info_lable.set_visible(false);
                             notescroller.set_visible(true);
                             torq_marker(&notescroller);
+                            window1.set_resizable(true);
                         } else {
                             eprintln!("Failed to read .desktop file: {}", path_str);
                         }
