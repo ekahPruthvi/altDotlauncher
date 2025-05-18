@@ -4,7 +4,7 @@ version = "1.0.9"
 edition = "2021"
 authors = ["ekahPruthvi <ekahpdp@gmail.com>"]
 description = "A Mossy dynamicLauncher"
-license = "MIT"
+license = "GPL-3.0"
 repository = "https://github.com/ekahPruthvi/moss.git"
 
 [dependencies]

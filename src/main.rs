@@ -115,7 +115,10 @@ fn strip_markdown_symbols(text: &str) -> String {
 }
 
 fn torq_marker(notescroller: &ScrolledWindow) {
-    const NOTES_PATH: &str = "/home/ekah/Documents/pipe/src/markers/notes.algae";
+    let home_dir = std::env::var("HOME").unwrap_or_default();
+    let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/moss/markers/notes.algae"]
+        .iter()
+        .collect();
 
     notescroller.set_hexpand(true);
     notescroller.set_vexpand(true);
@@ -136,6 +139,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
     text_view.set_margin_top(5);
     text_view.set_margin_start(5);
     text_view.set_margin_end(5);
+    text_view.set_opacity(0.7);
     notescroller.set_child(Some(&text_view));
 
     let tag_large = TextTag::builder()
@@ -143,7 +147,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
         .scale(gtk4::pango::SCALE_LARGE)
         .weight(900)
         .letter_spacing(1)
-        .font("Cantarell Heavy 20")
+        .font("Cantarell Heavy 18")
         .build();
 
     let tag_hidden = TextTag::builder()
@@ -154,7 +158,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
     let tag_code_prefix = TextTag::builder()
         .name("codeprefix")
         .background("rgba(153, 255, 158, 0.55)")
-        .font("FreeMono 17")
+        .font("FreeMono 13")
         .weight(200)
         .build();
 
@@ -162,7 +166,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
     buffer.tag_table().add(&tag_hidden);
     buffer.tag_table().add(&tag_code_prefix);
 
-    if let Ok(content) = std::fs::read_to_string(NOTES_PATH) {
+    if let Ok(content) = std::fs::read_to_string(&notes_path) {
         buffer.set_text(&content);
     }
 
@@ -221,8 +225,8 @@ fn torq_marker(notescroller: &ScrolledWindow) {
             }
 
             // Autosave
-            let _ = create_dir_all("/home/ekah/Documents/pipe/src/markers/");
-            let _ = write(NOTES_PATH, &text);
+            let _ = create_dir_all(format!("{}/.config/moss",&home_dir));
+            let _ = write(&notes_path, &text);
 
             is_formatting.set(false);
         }
@@ -237,6 +241,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
     }
 
     let buffer = buffer_rc.clone();
+
     buffer.connect_mark_set(move |_buffer, iter, mark| {
         if mark.name() == Some("insert".into()) {
             let mut iter = iter.clone();
@@ -837,9 +842,10 @@ fn build_ui(app: &Application) {
             border-color: rgba(73, 73, 73, 0.59);
         }
         .textview-style {
-            border-radius: 13px;
+            border-radius: 10px;
             padding: 100px;
             background-color: rgb(117, 197, 121);
+            border-bottom: 2.5px solid rgb(69, 116, 71);
             color: black;
             font-size: 12px;
             letter-spacing: 3px;
