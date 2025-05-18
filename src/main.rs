@@ -142,7 +142,8 @@ fn torq_marker(notescroller: &ScrolledWindow) {
         .name("large")
         .scale(gtk4::pango::SCALE_LARGE)
         .weight(900)
-        .font("FreeMono Bold 20")
+        .letter_spacing(1)
+        .font("Cantarell Heavy 20")
         .build();
 
     let tag_hidden = TextTag::builder()
@@ -840,8 +841,8 @@ fn build_ui(app: &Application) {
             padding: 100px;
             background-color: rgb(117, 197, 121);
             color: black;
-            font-size: 16px;
-            letter-spacing: 6px;
+            font-size: 12px;
+            letter-spacing: 3px;
         }
         .textview-style text {
             background-color: rgb(117, 197, 121);
