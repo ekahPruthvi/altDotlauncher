@@ -696,10 +696,14 @@ fn build_ui(app: &Application) {
                                         ai.set_visible(false);
                                     } else if input.to_lowercase() == "/s" {
                                         if let Some(last) = chat_history.borrow().last() {
+                                            let home_dir = std::env::var("HOME").unwrap_or_default();
+                                            let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/moss/markers/notes.algae"]
+                                                .iter()
+                                                .collect();
                                             let mut make_a_note = OpenOptions::new()
                                                 .create(true)        // Create the file if it doesn't exist
                                                 .append(true)        // Append to the end of the file
-                                                .open("/home/ekah/Documents/pipe/src/markers/notes.algae")
+                                                .open(notes_path)
                                                 .expect("Failed to open file");
 
                                             let now: DateTime<Local> = Local::now();
