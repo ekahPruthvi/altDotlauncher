@@ -267,7 +267,7 @@ fn build_ui(app: &Application) {
     let event_controller = gtk4::EventControllerKey::new();
     window.add_controller(event_controller.clone());
 
-    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    let vbox = GtkBox::new(Orientation::Vertical, 5);
 
     let entry = Entry::builder()
         .placeholder_text(" Search apps, open marker or use alterAi")
@@ -316,6 +316,7 @@ fn build_ui(app: &Application) {
     let aiinfo = Label::new(Some("  alterAi has volatile memory,\n so it will forget your conversations when the application is closed"));
     let dummy = GtkBox::new(Orientation::Vertical, 0);
     dummy.set_vexpand(true);
+    dummy.set_hexpand(true);
 
     aiinfo.set_margin_start(20);
     aiinfo.set_margin_end(20);
@@ -359,12 +360,40 @@ fn build_ui(app: &Application) {
     notescroller.add_css_class("no");
     notescroller.set_visible(false);
 
+    let taskbar = GtkBox::new(Orientation::Horizontal, 0);
+    taskbar.set_widget_name("taskbar");
+
+    // let file = gtk4::gio::File::for_path(Path::new("/home/ekah/Documents/pipe/moss.svg"));
+    // if let Ok(texture) = gtk4::gdk::Texture::from_file(&file) {
+    //     let picture = Picture::for_paintable(&texture);
+    //     picture.set_keep_aspect_ratio(true);
+    //     picture.set_size_request(20, 20);
+    //     taskbar.append(&picture);
+    // }
+
+
+    let moss = Label::new(Some(" ▄ ▄\n█ █ █ ●"));
+    moss.set_widget_name("tasks");
+    
+    let vdummy = GtkBox::new(Orientation::Vertical, 0);
+    vdummy.set_hexpand(true);
+    let run = Label::new(Some("run"));
+    run.set_widget_name("keylabels");
+    let altkey = Label::new(Some("L_ALT"));
+    altkey.set_widget_name("keys");
+
+    taskbar.append(&moss);
+    taskbar.append(&vdummy);
+    taskbar.append(&run);
+    taskbar.append(&altkey);
+
     vbox.append(&entry);
     vbox.append(&info_lable_revealer);
     vbox.append(&scroller);
     vbox.append(&terminal_box);
     vbox.append(&aiscroller);
     vbox.append(&notescroller);
+    vbox.append(&taskbar);
     window.set_child(Some(&vbox));
 
     let info_lable_revealer = Rc::new(info_lable_revealer);
@@ -669,10 +698,11 @@ fn build_ui(app: &Application) {
                                     entry_clone.set_visible(true);
                                     scroller_clone.set_visible(true);
                                 });
-                            } else {
+                            } else {                
                                 entry.set_visible(false);
                                 scroller.set_visible(false);
                                 info_lable.set_visible(false);
+                                taskbar.set_visible(false);
                                 aiscroller.set_visible(true);
                                 inpute.grab_focus();
                                 let chat_history: Rc<RefCell<Vec<ChatCompletionMessage>>> = Rc::new(RefCell::new(vec![]));
@@ -684,7 +714,7 @@ fn build_ui(app: &Application) {
                                 let clo= alterai_closure.clone();
                                 let aiclo = alterai.clone();
                                 let aiinfo = aiinfo.clone();
-                                
+                                let tb = taskbar.clone();
                                 inpute.connect_activate(move |e| {
                                     let input = e.text().to_string();
                                     let history = chat_history.clone();
@@ -693,6 +723,7 @@ fn build_ui(app: &Application) {
                                         ent.set_visible(true);
                                         sr.set_visible(true);
                                         info.set_visible(true);
+                                        tb.set_visible(true);
                                         ai.set_visible(false);
                                     } else if input.to_lowercase() == "/s" {
                                         if let Some(last) = chat_history.borrow().last() {
@@ -722,7 +753,7 @@ fn build_ui(app: &Application) {
                                             aiclo.append(&save_message);
 
                                             let vadj = ai.vadjustment();
-                                            vadj.set_value(vadj.lower());
+                                            vadj.set_value(vadj.upper());
                                         }
                                     } else {
                                         history.borrow_mut().push(ChatCompletionMessage {
@@ -804,6 +835,7 @@ fn build_ui(app: &Application) {
                             notescroller.set_visible(true);
                             torq_marker(&notescroller);
                             window1.set_resizable(true);
+                            window1.set_title(Some("marker"));
                         } else {
                             eprintln!("Failed to read .desktop file: {}", path_str);
                         }
@@ -969,7 +1001,39 @@ fn build_ui(app: &Application) {
             min-width: 0;
             min-height: 0;
         }   
-
+        #taskbar {
+            border-top: 0.5px solid rgba(139, 139, 139, 0.59);
+            padding: 10px;
+            padding-left: 15px;
+            border-bottom-left-radius: 13px;
+            border-bottom-right-radius: 13px;
+            background-color: rgba(139, 139, 139, 0.14);
+            box-shadow:none;
+        }
+        #tasks {
+            font-family: "Cantarell";
+            font-size: 10px;
+            line-height: 0.2
+            font-weight: 900; 
+            color: rgba(139, 139, 139, 0.59);
+        }
+        #keylabels {
+            font-family: "Cantarell";
+            font-weight: 900; 
+            color: rgba(139, 139, 139, 0.59);
+            font-size: 11px;
+            padding: 5px;
+        }
+        #keys {
+            background-color: rgba(124, 124, 124, 0.14);
+            font-family: "Cantarell";
+            font-weight: 900; 
+            color: rgba(139, 139, 139, 0.59);
+            font-size: 12px;
+            padding: 5px;
+            border-radius: 5px;  
+            border-bottom: 0.3px solid rgba(139, 139, 139, 0.59);
+        }
     "#;
 
     let provider = CssProvider::new();
