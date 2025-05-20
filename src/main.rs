@@ -372,7 +372,7 @@ fn build_ui(app: &Application) {
     // }
 
 
-    let moss = Label::new(Some(" ▄ ▄\n█ █ █ ●"));
+    let moss = Label::new(Some(" ▄▄ ▄\n█  █ █ ●"));
     moss.set_widget_name("tasks");
     
     let vdummy = GtkBox::new(Orientation::Vertical, 0);
@@ -833,6 +833,8 @@ fn build_ui(app: &Application) {
                             scroller.set_visible(false);
                             info_lable.set_visible(false);
                             notescroller.set_visible(true);
+                            altkey.set_visible(false);
+                            run.set_markup("<i>marker.</i>");
                             torq_marker(&notescroller);
                             window1.set_resizable(true);
                             window1.set_title(Some("marker"));
@@ -879,12 +881,11 @@ fn build_ui(app: &Application) {
         }
         .textview-style {
             border-radius: 10px;
-            padding: 100px;
+            padding: 80px;
             background-color: rgb(117, 197, 121);
             border-bottom: 2.5px solid rgb(69, 116, 71);
             color: black;
-            font-size: 12px;
-            letter-spacing: 3px;
+            font-size: 15px;
         }
         .textview-style text {
             background-color: rgb(117, 197, 121);
@@ -1013,7 +1014,7 @@ fn build_ui(app: &Application) {
         #tasks {
             font-family: "Cantarell";
             font-size: 10px;
-            line-height: 0.2
+            line-height: 1;
             font-weight: 900; 
             color: rgba(139, 139, 139, 0.59);
         }
@@ -1021,7 +1022,7 @@ fn build_ui(app: &Application) {
             font-family: "Cantarell";
             font-weight: 900; 
             color: rgba(139, 139, 139, 0.59);
-            font-size: 11px;
+            font-size: 14px;
             padding: 5px;
         }
         #keys {
