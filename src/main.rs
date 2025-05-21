@@ -348,6 +348,8 @@ fn build_ui(app: &Application) {
     aiscroller.set_visible(false);
 
     let vbox_inner = GtkBox::new(Orientation::Vertical, 12);
+    vbox_inner.set_hexpand(true);
+    
     let scroller = ScrolledWindow::new();
     scroller.set_vexpand(true);
     scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
@@ -372,7 +374,7 @@ fn build_ui(app: &Application) {
     // }
 
 
-    let moss = Label::new(Some(" ▄▄ ▄\n█  █ █ ●"));
+    let moss = Label::new(Some("▄▄▄ ▄\n   █ █  ●"));
     moss.set_widget_name("tasks");
     
     let vdummy = GtkBox::new(Orientation::Vertical, 0);
@@ -482,7 +484,9 @@ fn build_ui(app: &Application) {
             for (i, item) in items.iter().enumerate() {
                 let label = Label::new(Some(item));
                 label.set_widget_name(if i == 0 { "highlighted" } else { "" });
-                label.set_halign(gtk4::Align::Start);
+                label.set_hexpand(true);
+                label.set_halign(gtk4::Align::Fill);
+                label.set_xalign(0.0);
                 label.set_margin_start(20);
                 label.set_margin_end(20);
                 label.set_margin_bottom(20);
