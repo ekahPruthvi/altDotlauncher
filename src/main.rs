@@ -286,7 +286,6 @@ fn build_ui(app: &Application) {
     info_lable.set_margin_bottom(10);
     info_lable.set_margin_end(20);
     info_lable.set_margin_start(20);
-    info_lable.set_visible(false);
     info_lable.hexpands();
 
 
@@ -370,7 +369,7 @@ fn build_ui(app: &Application) {
     let taskbar = GtkBox::new(Orientation::Horizontal, 0);
     taskbar.set_widget_name("taskbar");
 
-    let moss = Label::new(Some("▄▄\n█ █ ●"));
+    let moss = Label::new(Some("alt ●"));
     moss.set_widget_name("tasks");
     
     let vdummy = GtkBox::new(Orientation::Vertical, 0);
@@ -380,16 +379,13 @@ fn build_ui(app: &Application) {
     let altkey = Label::new(Some("L_ALT"));
     altkey.set_widget_name("keys");
 
-    let image = Image::from_file("/home/ekah/Documents/pipe/alt_logo.svg");
-    image.set_widget_name("image-card");
-    image.set_margin_top(20);
-    image.set_margin_bottom(10);
-    image.set_margin_end(20);
-    image.set_margin_start(20);
-    image.set_size_request(800, 300);
+    // let image = Image::from_file("/home/ekah/Documents/pipe/alts_logo.svg");
+    // // image.set_widget_name("image-card");
+    // image.set_size_request(30, 30);
+    // image.set_opacity(0.3);
     
 
-    taskbar.append(&image);
+    taskbar.append(&moss);
     taskbar.append(&vdummy);
     taskbar.append(&run);
     taskbar.append(&altkey);
@@ -421,7 +417,6 @@ fn build_ui(app: &Application) {
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
         let info = info_lable.clone();
-        let img = image.clone();
 
         entry.connect_changed(move |e| {
             let text_in_entry = &e.text().to_string();
@@ -469,8 +464,6 @@ fn build_ui(app: &Application) {
                 _res_flag = true;
                 info.set_widget_name("info_lable-card");
             } else {
-                info.set_visible(true);
-                img.set_visible(false);
                 info.set_text(" type\n` for marker\n ! for alterAi");
                 _res_flag = false;
                 info.set_widget_name("info_lable-card");
@@ -892,7 +885,7 @@ fn build_ui(app: &Application) {
     
     let css = r#"
         window {
-            background-color: rgba(12, 22, 16, 0.6);
+            background-color: rgba(8, 15, 11, 0.71);
             border-radius: 14px;
             border-style: solid;
             border-width: 2px ;
@@ -916,7 +909,7 @@ fn build_ui(app: &Application) {
             font-size: 50px;
             border: 0.5px solid rgba(139, 139, 139, 0.59);
             font-family: "Adwaita Sans";
-            font-weight: 700;
+            font-weight: 900;
         }
         #image-card {
             background-color: rgba(139, 139, 139, 0.14);
@@ -1038,7 +1031,7 @@ fn build_ui(app: &Application) {
         }
         #tasks {
             font-family: "Cantarell";
-            font-size: 10px;
+            font-size: 16px;
             line-height: 0.9;
             font-weight: 900; 
             color: rgba(139, 139, 139, 0.59);
