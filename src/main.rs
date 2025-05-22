@@ -424,7 +424,8 @@ fn build_ui(app: &Application) {
             *current_items.borrow_mut() = items.clone();
             *current_file_path_name.borrow_mut() = file_path_name.clone();
             *selected_index.borrow_mut() = 0;
-            
+            taskbar.set_visible(true);
+
             // info flags
             if text_in_entry == "~t"{
                 let now: DateTime<Local> = Local::now();
@@ -454,7 +455,7 @@ fn build_ui(app: &Application) {
                 }
                 _res_flag = true;
             } else if text_in_entry == "`"{ 
-                info.set_text("open Marker\nThe alternate notes");
+                info.set_text("open Marker\nThe alternative notes");
                 _res_flag = true;
             } else if text_in_entry == "!"{
                 info.set_text("");
@@ -463,7 +464,6 @@ fn build_ui(app: &Application) {
                 info.set_widget_name("info_lable-card");
             } else {
                 info.set_text(" type\n` for marker\n ! for alterAi");
-                taskbar.set_visible(true);
                 _res_flag = false;
                 info.set_widget_name("info_lable-card");
             }
