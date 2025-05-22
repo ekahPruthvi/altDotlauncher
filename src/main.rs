@@ -279,16 +279,6 @@ fn build_ui(app: &Application) {
     let info_dock = GtkBox::new(Orientation::Vertical, 2);
     
 
-    let image = Image::from_file("/home/ekah/Documents/pipe/alt_logo.svg");
-    image.set_widget_name("image-card");
-    image.set_margin_top(20);
-    image.set_margin_bottom(10);
-    image.set_margin_end(20);
-    image.set_margin_start(20);
-    image.set_size_request(800, 300);
-
-    
-
     let info_lable = Label::new(Some(""));
     info_lable.set_markup("<i>welcome to Alt.</i> \ntype `/` to get started");
     info_lable.set_widget_name("info_lable-card");
@@ -299,13 +289,11 @@ fn build_ui(app: &Application) {
     info_lable.set_visible(false);
     info_lable.hexpands();
 
-    info_dock.append(&info_lable);
-    info_dock.append(&image);
 
     let info_lable_revealer = Revealer::builder()
         .transition_type(RevealerTransitionType::SlideUp)
         .transition_duration(300)
-        .child(&info_dock)
+        .child(&info_lable)
         .reveal_child(true)
         .build();
 
@@ -392,6 +380,16 @@ fn build_ui(app: &Application) {
     let altkey = Label::new(Some("L_ALT"));
     altkey.set_widget_name("keys");
 
+    let image = Image::from_file("/home/ekah/Documents/pipe/alt_logo.svg");
+    image.set_widget_name("image-card");
+    image.set_margin_top(20);
+    image.set_margin_bottom(10);
+    image.set_margin_end(20);
+    image.set_margin_start(20);
+    image.set_size_request(800, 300);
+    
+
+    taskbar.append(&image);
     taskbar.append(&vdummy);
     taskbar.append(&run);
     taskbar.append(&altkey);
