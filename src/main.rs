@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable, Image
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable,
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -276,9 +276,6 @@ fn build_ui(app: &Application) {
         .build();
     entry.set_visible(false);
 
-    let info_dock = GtkBox::new(Orientation::Vertical, 2);
-    
-
     let info_lable = Label::new(Some(""));
     info_lable.set_markup("<i>welcome to Alt.</i> \ntype `/` to get started");
     info_lable.set_widget_name("info_lable-card");
@@ -287,7 +284,6 @@ fn build_ui(app: &Application) {
     info_lable.set_margin_end(20);
     info_lable.set_margin_start(20);
     info_lable.hexpands();
-
 
     let info_lable_revealer = Revealer::builder()
         .transition_type(RevealerTransitionType::SlideUp)
@@ -368,6 +364,7 @@ fn build_ui(app: &Application) {
 
     let taskbar = GtkBox::new(Orientation::Horizontal, 0);
     taskbar.set_widget_name("taskbar");
+    taskbar.set_visible(false);
 
     let moss = Label::new(Some("alt ●"));
     moss.set_widget_name("tasks");
@@ -417,6 +414,7 @@ fn build_ui(app: &Application) {
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
         let info = info_lable.clone();
+        let taskbar = taskbar.clone();
 
         entry.connect_changed(move |e| {
             let text_in_entry = &e.text().to_string();
@@ -465,6 +463,7 @@ fn build_ui(app: &Application) {
                 info.set_widget_name("info_lable-card");
             } else {
                 info.set_text(" type\n` for marker\n ! for alterAi");
+                taskbar.set_visible(true);
                 _res_flag = false;
                 info.set_widget_name("info_lable-card");
             }
