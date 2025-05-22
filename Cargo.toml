@@ -1,11 +1,11 @@
 [package]
-name = "moss"
+name = "altDot"
 version = "1.2.0"
 edition = "2021"
 authors = ["ekahPruthvi <ekahpdp@gmail.com>"]
-description = "A Mossy dynamicLauncher"
+description = "An alternate dynamicLauncher"
 license = "GPL-3.0"
-repository = "https://github.com/ekahPruthvi/moss.git"
+repository = "https://github.com/ekahPruthvi/alt.git"
 
 [dependencies]
 chrono = "0.4.41"

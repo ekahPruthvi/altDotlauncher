@@ -18,6 +18,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
+name = "altDot"
+version = "1.2.0"
+dependencies = [
+ "chrono",
+ "fuzzy-matcher",
+ "glob",
+ "groq-api-rust",
+ "gtk4",
+ "tokio",
+ "vte4",
+]
+
+[[package]]
 name = "android-tzdata"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,19 +1030,6 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "moss"
-version = "1.2.0"
-dependencies = [
- "chrono",
- "fuzzy-matcher",
- "glob",
- "groq-api-rust",
- "gtk4",
- "tokio",
- "vte4",
 ]
 
 [[package]]

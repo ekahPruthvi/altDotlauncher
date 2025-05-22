@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable,
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable, Image
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -24,7 +24,7 @@ use std::io::Write;
 async fn run_gtk_app() {
     // Your GTK setup code here (including async Groq API calls)
     let app = Application::builder()
-        .application_id("ekah.scu.moss")
+        .application_id("ekah.scu.alt")
         .build();
 
     app.connect_activate(build_ui);
@@ -50,7 +50,7 @@ enum Mode {
 
 fn read_api_key() -> String {
     let home_dir = std::env::var("HOME").unwrap_or_default();
-    let key_path = format!("{}/.config/moss/key.dat", home_dir);
+    let key_path = format!("{}/.config/alt/key.dat", home_dir);
     fs::read_to_string(key_path)
         .expect("Failed to read API key file")
         .trim()
@@ -116,7 +116,7 @@ fn strip_markdown_symbols(text: &str) -> String {
 
 fn torq_marker(notescroller: &ScrolledWindow) {
     let home_dir = std::env::var("HOME").unwrap_or_default();
-    let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/moss/markers/notes.algae"]
+    let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/alt/markers/notes.algae"]
         .iter()
         .collect();
 
@@ -225,7 +225,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
             }
 
             // Autosave
-            let _ = create_dir_all(format!("{}/.config/moss",&home_dir));
+            let _ = create_dir_all(format!("{}/.config/alt",&home_dir));
             let _ = write(&notes_path, &text);
 
             is_formatting.set(false);
@@ -257,7 +257,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("moss")
+        .title("alt.")
         .default_width(1000)
         .default_height(400)
         .resizable(false)
@@ -276,19 +276,36 @@ fn build_ui(app: &Application) {
         .build();
     entry.set_visible(false);
 
+    let info_dock = GtkBox::new(Orientation::Vertical, 2);
+    
+
+    let image = Image::from_file("/home/ekah/Documents/pipe/alt_logo.svg");
+    image.set_widget_name("image-card");
+    image.set_margin_top(20);
+    image.set_margin_bottom(10);
+    image.set_margin_end(20);
+    image.set_margin_start(20);
+    image.set_size_request(800, 300);
+
+    
+
     let info_lable = Label::new(Some(""));
-    info_lable.set_markup(" <i>Moss</i> \ntype `/` to get started");
+    info_lable.set_markup("<i>welcome to Alt.</i> \ntype `/` to get started");
     info_lable.set_widget_name("info_lable-card");
     info_lable.set_margin_top(20);
     info_lable.set_margin_bottom(10);
     info_lable.set_margin_end(20);
     info_lable.set_margin_start(20);
+    info_lable.set_visible(false);
     info_lable.hexpands();
+
+    info_dock.append(&info_lable);
+    info_dock.append(&image);
 
     let info_lable_revealer = Revealer::builder()
         .transition_type(RevealerTransitionType::SlideUp)
         .transition_duration(300)
-        .child(&info_lable)
+        .child(&info_dock)
         .reveal_child(true)
         .build();
 
@@ -365,16 +382,7 @@ fn build_ui(app: &Application) {
     let taskbar = GtkBox::new(Orientation::Horizontal, 0);
     taskbar.set_widget_name("taskbar");
 
-    // let file = gtk4::gio::File::for_path(Path::new("/home/ekah/Documents/pipe/moss.svg"));
-    // if let Ok(texture) = gtk4::gdk::Texture::from_file(&file) {
-    //     let picture = Picture::for_paintable(&texture);
-    //     picture.set_keep_aspect_ratio(true);
-    //     picture.set_size_request(20, 20);
-    //     taskbar.append(&picture);
-    // }
-
-
-    let moss = Label::new(Some("▄▄▄ ▄\n   █ █  ●"));
+    let moss = Label::new(Some("▄▄\n█ █ ●"));
     moss.set_widget_name("tasks");
     
     let vdummy = GtkBox::new(Orientation::Vertical, 0);
@@ -384,7 +392,6 @@ fn build_ui(app: &Application) {
     let altkey = Label::new(Some("L_ALT"));
     altkey.set_widget_name("keys");
 
-    taskbar.append(&moss);
     taskbar.append(&vdummy);
     taskbar.append(&run);
     taskbar.append(&altkey);
@@ -416,6 +423,7 @@ fn build_ui(app: &Application) {
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
         let info = info_lable.clone();
+        let img = image.clone();
 
         entry.connect_changed(move |e| {
             let text_in_entry = &e.text().to_string();
@@ -455,7 +463,7 @@ fn build_ui(app: &Application) {
                 }
                 _res_flag = true;
             } else if text_in_entry == "`"{ 
-                info.set_text("open Marker\nThe mossy notes");
+                info.set_text("open Marker\nThe alternate notes");
                 _res_flag = true;
             } else if text_in_entry == "!"{
                 info.set_text("");
@@ -463,6 +471,8 @@ fn build_ui(app: &Application) {
                 _res_flag = true;
                 info.set_widget_name("info_lable-card");
             } else {
+                info.set_visible(true);
+                img.set_visible(false);
                 info.set_text(" type\n` for marker\n ! for alterAi");
                 _res_flag = false;
                 info.set_widget_name("info_lable-card");
@@ -732,7 +742,7 @@ fn build_ui(app: &Application) {
                                     } else if input.to_lowercase() == "/s" {
                                         if let Some(last) = chat_history.borrow().last() {
                                             let home_dir = std::env::var("HOME").unwrap_or_default();
-                                            let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/moss/markers/notes.algae"]
+                                            let notes_path: std::path::PathBuf = [home_dir.as_str(), ".config/alt/markers/notes.algae"]
                                                 .iter()
                                                 .collect();
                                             let mut make_a_note = OpenOptions::new()
@@ -857,7 +867,14 @@ fn build_ui(app: &Application) {
                 gtk4::gdk::Key::Escape => {
                     std::process::exit(0);
                 }
-                _ => return glib::Propagation::Proceed,
+                gtk4::gdk::Key::Super_L | gtk4::gdk::Key::Super_R  => {
+                    return glib::Propagation::Proceed;
+                }
+                _ => {
+                    entry.set_visible(true);
+                    entry.grab_focus();
+                    return glib::Propagation::Proceed;
+                }
             }
 
             // Update labels
@@ -877,8 +894,8 @@ fn build_ui(app: &Application) {
     
     let css = r#"
         window {
-            background-color: rgba(20, 37, 27, 0.6);
-            border-radius: 13px;
+            background-color: rgba(12, 22, 16, 0.6);
+            border-radius: 14px;
             border-style: solid;
             border-width: 2px ;
             border-color: rgba(73, 73, 73, 0.59);
@@ -902,6 +919,12 @@ fn build_ui(app: &Application) {
             border: 0.5px solid rgba(139, 139, 139, 0.59);
             font-family: "Adwaita Sans";
             font-weight: 700;
+        }
+        #image-card {
+            background-color: rgba(139, 139, 139, 0.14);
+            border-radius: 12px;
+            opacity: 0.5;
+            border: 1px solid rgba(139, 139, 139, 0.59);
         }
         #batg {
             background-color: rgba(117, 197, 121, 0.21);
@@ -951,7 +974,7 @@ fn build_ui(app: &Application) {
             border-color: rgba(139, 139, 139, 0.5);
         }
         #alterai_box {
-            background-color: rgba(139, 139, 139, 0.14);
+            background-color: rgba(0, 0, 0, 0.14);
             border-radius: 12px;
             border: 0.5px solid rgba(139, 139, 139, 0.59);
         }
@@ -1007,18 +1030,18 @@ fn build_ui(app: &Application) {
             min-height: 0;
         }   
         #taskbar {
-            border-top: 0.5px solid rgba(139, 139, 139, 0.59);
+            border-top: 0.5px solid rgba(139, 139, 139, 0.39);
             padding: 10px;
             padding-left: 15px;
-            border-bottom-left-radius: 13px;
-            border-bottom-right-radius: 13px;
+            border-bottom-left-radius: 12px;
+            border-bottom-right-radius: 12px;
             background-color: rgba(139, 139, 139, 0.14);
             box-shadow:none;
         }
         #tasks {
             font-family: "Cantarell";
             font-size: 10px;
-            line-height: 1;
+            line-height: 0.9;
             font-weight: 900; 
             color: rgba(139, 139, 139, 0.59);
         }
