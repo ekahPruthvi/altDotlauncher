@@ -257,6 +257,7 @@ fn torq_marker(notescroller: &ScrolledWindow) {
 fn create_icon_button(icon_name: &str, exec_command: String) -> Button {
     // You can also use Image::from_icon_name if it's a known system icon
     let image = Image::from_icon_name(icon_name);
+    image.set_icon_size(gtk4::IconSize::Normal);
 
     let button = Button::builder()
         .child(&image)
@@ -322,8 +323,8 @@ fn build_ui(app: &Application) {
     terminal_box.set_vexpand(true);
     terminal_box.set_hexpand(true);
     terminal_box.set_size_request(1500, 800);
-    terminal_box.set_margin_start(4);
-    terminal_box.set_margin_end(4);
+    terminal_box.set_margin_start(7);
+    terminal_box.set_margin_end(7);
     terminal_box.set_margin_top(4);
     terminal_box.set_margin_bottom(4);
     terminal_box.append(&terminal);
@@ -552,6 +553,8 @@ fn build_ui(app: &Application) {
     }
 
     {   
+
+        let first_press = Cell::new(true);
         event_controller.connect_key_pressed(move |_, key, _, _| {
             let mut index = selected_index.borrow_mut();
             let items = current_items.borrow();
@@ -695,6 +698,9 @@ fn build_ui(app: &Application) {
                                     let command = &exec;
                                     let argv = ["sh", "-c", command];
 
+                                    run.set_markup(&format!("<i>{}</i>",command));
+                                    altkey.set_visible(false);
+
                                     terminal.spawn_async(
                                         PtyFlags::DEFAULT,
                                         None,      
@@ -713,11 +719,15 @@ fn build_ui(app: &Application) {
                                     let terminal_box_clone = terminal_box.clone();
                                     let entry_clone = entry.clone();
                                     let scroller_clone=scroller.clone();
+                                    let run_clone = run.clone();
+                                    let altkey_clone = altkey.clone();
 
                                     terminal.connect_child_exited(move |_terminal, _status| {
                                         terminal_box_clone.set_visible(false);
                                         entry_clone.set_visible(true);
                                         scroller_clone.set_visible(true);
+                                        run_clone.set_text("run");
+                                        altkey_clone.set_visible(true);
                                     });
                                 } else {
                                     let sanitized_command = exec
@@ -1017,17 +1027,19 @@ fn build_ui(app: &Application) {
                 gtk4::gdk::Key::slash => {
                     entry.set_visible(true);
                     entry.grab_focus();
+                    first_press.set(false);
                     info_lable.set_text(" type\n` for marker\n ! for alterAi");
                 }
                 gtk4::gdk::Key::Escape => {
-                    std::process::exit(0);
-                }
-                gtk4::gdk::Key::Super_L | gtk4::gdk::Key::Super_R  => {
-                    return glib::Propagation::Proceed;
+                    exit(0);
                 }
                 _ => {
-                    entry.set_visible(true);
-                    entry.grab_focus();
+                    print!("{}",first_press.get());
+                    if first_press.get() {
+                        first_press.set(false);
+                        entry.set_visible(true);
+                        entry.grab_focus();                  
+                    }                      
                     return glib::Propagation::Proceed;
                 }
             }
@@ -1157,7 +1169,7 @@ fn build_ui(app: &Application) {
             padding: 10px;
             font-size: 12px;
             font-family: "Cantarell";
-            font-weight: 200;
+            font-weight: 600;
             background-color: rgba(139, 139, 139, 0.14);
         }
         #save_info {
@@ -1168,7 +1180,7 @@ fn build_ui(app: &Application) {
         }
         #aitry{
             border-top: 0.5px solid rgba(139, 139, 139, 0.59);
-            padding: 10px;
+            padding: 20px;
             padding-left: 15px;
             border-bottom-left-radius: 12px;
             border-bottom-right-radius: 12px;
