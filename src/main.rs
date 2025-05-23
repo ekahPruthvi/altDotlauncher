@@ -518,16 +518,19 @@ fn build_ui(app: &Application) {
                         if let Ok(contents) = fs::read_to_string(&path) {
                             let mut exec_line = None;
                             let mut terminal_flag = false;
+                            let mut in_desktop_entry = false;
 
                             for line in contents.lines() {
-                                if line.starts_with("Terminal=") {
+                                let trimmed = line.trim();
+                                if trimmed.starts_with('[') {
+                                    in_desktop_entry = trimmed == "[Desktop Entry]";
+                                } else if in_desktop_entry && trimmed.starts_with("Exec=") {
+                                    exec_line = Some(trimmed.trim_start_matches("Exec=").to_string());
+                                } else if in_desktop_entry && line.starts_with("Terminal=") {
                                     terminal_flag = line.trim_start_matches("Terminal=").trim() == "true";
                                 }
-                                if line.starts_with("Exec=") {
-                                    exec_line = Some(line.trim_start_matches("Exec=").trim().to_string());
-                                }
                             }
-
+                            
                             if let Some(exec) = exec_line {
                                 if terminal_flag {
                                     entry.set_visible(false);
@@ -562,9 +565,19 @@ fn build_ui(app: &Application) {
                                         scroller_clone.set_visible(true);
                                     });
                                 } else {
-                                    let command = exec.split_whitespace().next().unwrap_or("");
-                                    if !command.is_empty() && command != "bash" {
-                                        if let Err(e) = Command::new(command).spawn() {
+                                    let sanitized_command = exec
+                                        .split_whitespace()
+                                        .map(|arg| if arg.starts_with('%') { "" } else { arg })
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+
+                                    if !sanitized_command.is_empty() {
+                                        print!("{}", sanitized_command);
+                                        if let Err(e) = Command::new("sh")
+                                            .arg("-c")
+                                            .arg(sanitized_command)
+                                            .spawn()
+                                        {
                                             eprintln!("Failed to start GUI app: {}", e);
                                         }
                                         exit(0);
@@ -1066,26 +1079,8 @@ fn build_ui(app: &Application) {
     window.show();
 }
 
-fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
-    if input.starts_with('`') {
-        return (Mode::Notes, vec![format!("Open Marker")], vec![input.to_string()]);
-    }
-
-    if input.starts_with('!') {
-        return (
-            Mode::Ai,
-            vec![
-                format!("Enter chat"),
-            ],
-            vec![
-                input.to_string()
-            ]
-        );
-    }
-
-    let mut pairs = Vec::new(); // Vec<(app_name, path_str)>
-
-    if let Ok(read_dir) = fs::read_dir("/usr/share/applications") {
+fn collect_desktop_apps<P: AsRef<Path>>(dir: P, pairs: &mut Vec<(String, String)>) {
+    if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
@@ -1102,7 +1097,6 @@ fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
 
                 for line in content.lines() {
                     let line = line.trim();
-
                     if line.starts_with('[') {
                         in_desktop_entry = line == "[Desktop Entry]";
                     }
@@ -1119,11 +1113,28 @@ fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
             }
         }
     }
+}
+
+fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
+    if input.starts_with('`') {
+        return (Mode::Notes, vec![format!("Open Marker")], vec![input.to_string()]);
+    }
+
+    if input.starts_with('!') {
+        return (
+            Mode::Ai,
+            vec![format!("Enter chat")],
+            vec![input.to_string()],
+        );
+    }
+
+    let mut pairs = Vec::new();
+    collect_desktop_apps("/usr/share/applications", &mut pairs);
+    collect_desktop_apps("/var/lib/flatpak/exports/share/applications", &mut pairs);
 
     if input.starts_with('~') {
-        // check for info flages
-        if input.len() > 1  {
-            return (Mode::None,Vec::new(),Vec::new());
+        if input.len() > 1 {
+            return (Mode::None, Vec::new(), Vec::new());
         }
 
         let (entries, paths): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
