@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable,
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable, Button, Image
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -19,7 +19,7 @@ use groq_api_rust::{AsyncGroqClient, ChatCompletionRequest, ChatCompletionRoles,
 use tokio::runtime::Runtime;
 use std::cell::Cell;
 use std::fs::{create_dir_all, write, OpenOptions};
-use std::io::Write;
+use std::io::{ Write, Read };
 
 async fn run_gtk_app() {
     // Your GTK setup code here (including async Groq API calls)
@@ -254,6 +254,26 @@ fn torq_marker(notescroller: &ScrolledWindow) {
 
 }
 
+fn create_icon_button(icon_name: &str, exec_command: String) -> Button {
+    // You can also use Image::from_icon_name if it's a known system icon
+    let image = Image::from_icon_name(icon_name);
+
+    let button = Button::builder()
+        .child(&image)
+        .tooltip_text(&exec_command)
+        .build();
+
+    button.connect_clicked(move |_| {
+        // Run in background
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(&exec_command)
+            .spawn();
+    });
+
+    button
+}
+
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -263,6 +283,7 @@ fn build_ui(app: &Application) {
         .resizable(false)
         .decorated(false)
         .build();
+    
     let window1 = window.clone();
     let event_controller = gtk4::EventControllerKey::new();
     window.add_controller(event_controller.clone());
@@ -364,30 +385,64 @@ fn build_ui(app: &Application) {
 
     let taskbar = GtkBox::new(Orientation::Horizontal, 0);
     taskbar.set_widget_name("taskbar");
-    taskbar.set_visible(false);
 
     let moss = Label::new(Some("alt ●"));
     moss.set_widget_name("tasks");
     
-    let vdummy = GtkBox::new(Orientation::Vertical, 0);
-    vdummy.set_hexpand(true);
+    let vdummyl = GtkBox::new(Orientation::Vertical, 0);
+    vdummyl.set_hexpand(true);
+
+        let vdummyr = GtkBox::new(Orientation::Vertical, 0);
+    vdummyr.set_hexpand(true);
+
     let run = Label::new(Some("run"));
     run.set_widget_name("keylabels");
+
     let altkey = Label::new(Some("L_ALT"));
     altkey.set_widget_name("keys");
 
-    // let image = Image::from_file("/home/ekah/Documents/pipe/alts_logo.svg");
-    // // image.set_widget_name("image-card");
-    // image.set_size_request(30, 30);
-    // image.set_opacity(0.3);
-    
+    let quicklaunch = GtkBox::new(Orientation::Horizontal, 5);
+    let home = std::env::var("HOME").unwrap_or_default();
+    let qlpath = format!("{}/.config/alt/ql.dat", home);
+    let commands: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let commands_ql_launch = commands.clone();
+     if let Ok(contents) = fs::read_to_string(qlpath) {
+        let mut exec = None;
+        let mut icon = None;
+
+        for line in contents.lines() {
+            if line.starts_with("Exec=") {
+                exec = Some(line.trim_start_matches("Exec=").to_string());
+            } else if line.starts_with("Icon=") {
+                icon = Some(line.trim_start_matches("Icon=").to_string());
+            }
+
+            if let (Some(exec_val), Some(icon_val)) = (&exec, &icon) {
+                let exec_clone = exec_val.clone();
+                commands.borrow_mut().push(exec_clone.clone());
+
+                let button = create_icon_button(&icon_val, exec_clone);
+                quicklaunch.append(&button);
+
+                exec = None;
+                icon = None;
+            }
+        }
+    }
 
     taskbar.append(&moss);
-    taskbar.append(&vdummy);
+    taskbar.append(&vdummyl);
+    taskbar.append(&quicklaunch);
+    taskbar.append(&vdummyr);
     taskbar.append(&run);
     taskbar.append(&altkey);
 
+    let ql_info = Label::new(Some(""));
+    ql_info.set_widget_name("ql_info");
+    ql_info.set_visible(false);
+
     vbox.append(&entry);
+    vbox.append(&ql_info);
     vbox.append(&info_lable_revealer);
     vbox.append(&scroller);
     vbox.append(&terminal_box);
@@ -398,6 +453,7 @@ fn build_ui(app: &Application) {
 
     let info_lable_revealer = Rc::new(info_lable_revealer);
     let vbox_opt = Rc::new(vbox_inner);
+    let ql_info = ql_info.clone();
     let selected_index = Rc::new(RefCell::new(0));
     let current_items = Rc::new(RefCell::new(Vec::new()));
     let current_mode = Rc::new(RefCell::new(Mode::App));
@@ -414,7 +470,7 @@ fn build_ui(app: &Application) {
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
         let info = info_lable.clone();
-        let taskbar = taskbar.clone();
+        let ql = quicklaunch.clone();
 
         entry.connect_changed(move |e| {
             let text_in_entry = &e.text().to_string();
@@ -424,7 +480,7 @@ fn build_ui(app: &Application) {
             *current_items.borrow_mut() = items.clone();
             *current_file_path_name.borrow_mut() = file_path_name.clone();
             *selected_index.borrow_mut() = 0;
-            taskbar.set_visible(true);
+            ql.set_visible(false);
 
             // info flags
             if text_in_entry == "~t"{
@@ -510,6 +566,105 @@ fn build_ui(app: &Application) {
                     if *index > 0 {
                         *index -= 1;
                     }
+                }
+                gtk4::gdk::Key::_1
+                | gtk4::gdk::Key::_2
+                | gtk4::gdk::Key::_3
+                | gtk4::gdk::Key::_4
+                | gtk4::gdk::Key::_5
+                | gtk4::gdk::Key::_6
+                | gtk4::gdk::Key::_7
+                | gtk4::gdk::Key::_8
+                | gtk4::gdk::Key::_9 => {
+                    let commands = commands_ql_launch.borrow();
+                    if let Some(name) = key.name() {
+                        let digit_str = name.trim();
+
+                        if let Ok(index) = digit_str.parse::<usize>() {
+                            // Now you have the number as a usize
+                            println!("You pressed: {}", index);
+                            if index >= 1 && index <= commands.len() {
+                                let command = &commands[index - 1]; // convert 1-based to 0-based index
+                                let _ = std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(command)
+                                    .spawn();
+                                exit(1);
+                            }
+                        }
+                    }                  
+                }
+                gtk4::gdk::Key::Tab => {
+                    if let Some(file_name) = file_path_name.get(*index) {
+                        let path_str = format!("{}",&file_name);  
+                        let path = Path::new(&path_str);
+                        if let Ok(contents) = fs::read_to_string(&path) {
+                            let mut exec_line = None;
+                            let mut in_desktop_entry = false;
+                            let mut icon = None;
+
+                            for line in contents.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.starts_with('[') {
+                                    in_desktop_entry = trimmed == "[Desktop Entry]";
+                                } else if in_desktop_entry && trimmed.starts_with("Exec=") {
+                                    exec_line = Some(trimmed.trim_start_matches("Exec=").to_string().split_whitespace()
+                                        .map(|arg| if arg.starts_with('%') { "" } else { arg })
+                                        .collect::<Vec<_>>()
+                                        .join(" "));
+                                } else if in_desktop_entry && trimmed.starts_with("Icon=") {
+                                    icon = Some(trimmed.trim_start_matches("Icon=").to_string());
+                                }
+                            }
+
+
+                             if let (Some(exec), Some(icon)) = (exec_line, icon) {
+                                let home_dir = std::env::var("HOME").unwrap_or_default();
+                                let qlpath: std::path::PathBuf = [home_dir.as_str(), ".config/alt/ql.dat"].iter().collect();
+                                let ql_info = ql_info.clone();
+
+                                // Read existing content
+                                let mut existing = String::new();
+                                if let Ok(mut file) = OpenOptions::new().read(true).open(&qlpath) {
+                                    file.read_to_string(&mut existing).unwrap_or_default();
+                                }
+
+                                // Build new entry
+                                let new_entry = format!("Exec={}\nIcon={}", exec, icon);
+
+                                // Remove existing matching block if it exists
+                                let mut lines: Vec<&str> = existing.lines().collect();
+                                let mut i = 0;
+                                while i < lines.len() {
+                                    if lines[i].starts_with("Exec=") && lines[i] == format!("Exec={}", exec) {
+                                        if i + 1 < lines.len() && lines[i + 1] == format!("Icon={}", icon) {
+                                            lines.drain(i..=i + 1);
+                                            fs::write(&qlpath, lines.join("\n")).expect("Failed to write after removing");
+                                            ql_info.set_text("removed from quickLaunch");
+                                            ql_info.set_visible(true);
+                                            glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                                                ql_info.set_visible(false);
+                                            });
+                                            return glib::Propagation::Proceed;
+                                        }
+                                    }
+                                    i += 1;
+                                }
+
+                                // Append the new entry
+                                lines.push("");
+                                lines.push(&new_entry);
+
+                                // Write back cleaned + updated content
+                                fs::write(&qlpath, lines.join("\n")).expect("Failed to write to ql.dat");
+                                ql_info.set_text("added to quickLaunch");
+                                ql_info.set_visible(true);
+                                glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                                    ql_info.set_visible(false);
+                                });
+                            }
+                        }
+                    }                    
                 }
                 gtk4::gdk::Key::Alt_L => {
                     if let Some(file_name) = file_path_name.get(*index) {
@@ -768,9 +923,6 @@ fn build_ui(app: &Application) {
                                             save_message.set_max_width_chars(20);
                                             save_message.set_halign(gtk4::Align::Center);
                                             aiclo.append(&save_message);
-
-                                            let vadj = ai.vadjustment();
-                                            vadj.set_value(vadj.upper());
                                         }
                                     } else {
                                         history.borrow_mut().push(ChatCompletionMessage {
@@ -948,8 +1100,9 @@ fn build_ui(app: &Application) {
             font-weight: 700;
         }
         entry {
+            all: unset;
             border-bottom: 1px solid rgba(73, 73, 73, 0.59);
-            padding: 10px;
+            padding: 20px;
             padding-left: 15px;
             border-radius: 0px;
             background-color: rgba(0, 0, 0, 0.1);
@@ -999,6 +1152,13 @@ fn build_ui(app: &Application) {
             box-shadow: 0px 0px 5px rgba(0, 0, 0, 0.26);
             font-family: "Cantarell";
             font-weight: 600;
+        }
+        #ql_info {
+            padding: 10px;
+            font-size: 12px;
+            font-family: "Cantarell";
+            font-weight: 200;
+            background-color: rgba(139, 139, 139, 0.14);
         }
         #save_info {
             padding: 10px;
