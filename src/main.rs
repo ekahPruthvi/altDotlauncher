@@ -1030,6 +1030,7 @@ fn build_ui(app: &Application) {
                 }
                 gtk4::gdk::Key::slash => {
                     entry.set_visible(true);
+                    ql_revealer.set_reveal_child(false);
                     entry.grab_focus();
                     first_press.set(false);
                     info_lable.set_text(" type\n` for marker\n ! for alterAi");
