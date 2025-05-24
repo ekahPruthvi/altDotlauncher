@@ -553,7 +553,6 @@ fn build_ui(app: &Application) {
     }
 
     {   
-
         let first_press = Cell::new(true);
         event_controller.connect_key_pressed(move |_, key, _, _| {
             let mut index = selected_index.borrow_mut();
