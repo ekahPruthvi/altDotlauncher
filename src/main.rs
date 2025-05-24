@@ -270,6 +270,7 @@ fn create_icon_button(icon_name: &str, exec_command: String) -> Button {
             .arg("-c")
             .arg(&exec_command)
             .spawn();
+        exit(1)
     });
 
     button
