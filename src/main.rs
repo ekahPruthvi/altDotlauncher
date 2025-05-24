@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use vte4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Entry, Label, Orientation,
-    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable, Button, Image
+    Revealer, RevealerTransitionType, ScrolledWindow, gio::Cancellable, prelude::WidgetExt, TextView, TextBuffer, TextTag, TextTagTable, Button, Image,
 };
 use gtk4::gdk::Display;
 use gtk4::glib;
@@ -431,9 +431,16 @@ fn build_ui(app: &Application) {
         }
     }
 
+    let ql_revealer = Revealer::builder()
+        .transition_type(RevealerTransitionType::SwingDown)
+        .transition_duration(300)
+        .child(&quicklaunch)
+        .reveal_child(true)
+        .build();
+
     taskbar.append(&moss);
     taskbar.append(&vdummyl);
-    taskbar.append(&quicklaunch);
+    taskbar.append(&ql_revealer);
     taskbar.append(&vdummyr);
     taskbar.append(&run);
     taskbar.append(&altkey);
@@ -471,7 +478,6 @@ fn build_ui(app: &Application) {
         let current_mode = current_mode.clone();
         let current_file_path_name=current_file_path_name.clone();
         let info = info_lable.clone();
-        let ql = quicklaunch.clone();
 
         entry.connect_changed(move |e| {
             let text_in_entry = &e.text().to_string();
@@ -481,7 +487,6 @@ fn build_ui(app: &Application) {
             *current_items.borrow_mut() = items.clone();
             *current_file_path_name.borrow_mut() = file_path_name.clone();
             *selected_index.borrow_mut() = 0;
-            ql.set_visible(false);
 
             // info flags
             if text_in_entry == "~t"{
@@ -1035,6 +1040,7 @@ fn build_ui(app: &Application) {
                 _ => {
                     print!("{}",first_press.get());
                     if first_press.get() {
+                        ql_revealer.set_reveal_child(false);
                         first_press.set(false);
                         entry.set_visible(true);
                         entry.grab_focus();                  
