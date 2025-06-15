@@ -1068,8 +1068,8 @@ fn build_ui(app: &Application) {
     
     let css = r#"
         window {
-            background-color: rgba(8, 15, 11, 0.71);
-            border-radius: 14px;
+            background-color: rgba(8, 15, 11, 0.56);
+            border-radius: 15px;
             border-style: solid;
             border-width: 2px ;
             border-color: rgba(73, 73, 73, 0.59);
