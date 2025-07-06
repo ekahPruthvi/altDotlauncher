@@ -564,15 +564,20 @@ fn build_ui(app: &Application) {
             let mut index = selected_index.borrow_mut();
             let items = current_items.borrow();
             let file_path_name=current_file_path_name.borrow();
+            let adj = scroller.vadjustment();
             match key {
                 gtk4::gdk::Key::Down => {
                     if *index + 1 < items.len() {
                         *index += 1;
+                        let target_scroll = (*index as f64) * 50.0;
+                        adj.set_value(target_scroll);
                     }
                 }
                 gtk4::gdk::Key::Up => {
                     if *index > 0 {
                         *index -= 1;
+                        let target_scroll = (*index as f64) * 50.0;
+                        adj.set_value(target_scroll);
                     }
                 }
                 gtk4::gdk::Key::_1
