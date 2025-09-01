@@ -404,8 +404,7 @@ fn build_ui(app: &Application) {
     altkey.set_widget_name("keys");
 
     let quicklaunch = GtkBox::new(Orientation::Horizontal, 5);
-    let home = std::env::var("HOME").unwrap_or_default();
-    let qlpath = format!("{}/.config/alt/ql.dat", home);
+    let qlpath = format!("/var/lib/cynager/ql.dat");
     let commands: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let commands_ql_launch = commands.clone();
      if let Ok(contents) = fs::read_to_string(qlpath) {
