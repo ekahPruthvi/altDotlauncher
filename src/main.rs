@@ -403,6 +403,7 @@ fn build_ui(app: &Application) {
     let altkey = Label::new(Some("L_ALT"));
     altkey.set_widget_name("keys");
 
+    
     let quicklaunch = GtkBox::new(Orientation::Horizontal, 5);
     let qlpath = format!("/var/lib/cynager/ql.dat");
     let commands: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
