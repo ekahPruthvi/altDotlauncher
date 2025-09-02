@@ -22,7 +22,6 @@ use std::fs::{create_dir_all, write, OpenOptions};
 use std::io::{ Write, Read };
 
 async fn run_gtk_app() {
-    // Your GTK setup code here (including async Groq API calls)
     let app = Application::builder()
         .application_id("ekah.scu.alt")
         .build();
@@ -34,7 +33,6 @@ async fn run_gtk_app() {
 
 fn main() {
     let rt = Runtime::new().unwrap();
-    // Command::new("bash").arg("-c").arg("cd").arg("~/");
     
     rt.block_on(run_gtk_app());
 }
@@ -172,7 +170,6 @@ fn torq_marker(notescroller: &ScrolledWindow) {
 
     let buffer_rc = Rc::new(buffer);
     let is_formatting = Rc::new(Cell::new(false));
-    // -- Define reusable formatting function
     let apply_formatting = {
         let buffer = buffer_rc.clone();
         let is_formatting = is_formatting.clone();
@@ -248,14 +245,12 @@ fn torq_marker(notescroller: &ScrolledWindow) {
             text_view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
         }
     });
-    // -- Trigger formatting immediately
     apply_formatting();
     
 
 }
 
 fn create_icon_button(icon_name: &str, exec_command: String) -> Button {
-    // You can also use Image::from_icon_name if it's a known system icon
     let image = Image::from_icon_name(icon_name);
     image.set_icon_size(gtk4::IconSize::Normal);
 
@@ -265,7 +260,6 @@ fn create_icon_button(icon_name: &str, exec_command: String) -> Button {
         .build();
 
     button.connect_clicked(move |_| {
-        // Run in background
         let _ = Command::new("sh")
             .arg("-c")
             .arg(&exec_command)
@@ -471,7 +465,6 @@ fn build_ui(app: &Application) {
     let terminal_box = Rc::new(terminal_box);
     let _ai = false;
 
-
     {
         let vbox_opt = vbox_opt.clone();
         let selected_index = selected_index.clone();
@@ -594,10 +587,9 @@ fn build_ui(app: &Application) {
                         let digit_str = name.trim();
 
                         if let Ok(index) = digit_str.parse::<usize>() {
-                            // Now you have the number as a usize
                             println!("You pressed: {}", index);
                             if index >= 1 && index <= commands.len() {
-                                let command = &commands[index - 1]; // convert 1-based to 0-based index
+                                let command = &commands[index - 1];
                                 let _ = std::process::Command::new("sh")
                                     .arg("-c")
                                     .arg(command)
@@ -636,16 +628,13 @@ fn build_ui(app: &Application) {
                                 let qlpath: std::path::PathBuf = [home_dir.as_str(), ".config/alt/ql.dat"].iter().collect();
                                 let ql_info = ql_info.clone();
 
-                                // Read existing content
                                 let mut existing = String::new();
                                 if let Ok(mut file) = OpenOptions::new().read(true).open(&qlpath) {
                                     file.read_to_string(&mut existing).unwrap_or_default();
                                 }
 
-                                // Build new entry
                                 let new_entry = format!("Exec={}\nIcon={}", exec, icon);
 
-                                // Remove existing matching block if it exists
                                 let mut lines: Vec<&str> = existing.lines().collect();
                                 let mut i = 0;
                                 while i < lines.len() {
@@ -664,11 +653,9 @@ fn build_ui(app: &Application) {
                                     i += 1;
                                 }
 
-                                // Append the new entry
                                 lines.push("");
                                 lines.push(&new_entry);
 
-                                // Write back cleaned + updated content
                                 fs::write(&qlpath, lines.join("\n")).expect("Failed to write to ql.dat");
                                 ql_info.set_text("added to quickLaunch");
                                 ql_info.set_visible(true);
@@ -924,8 +911,8 @@ fn build_ui(app: &Application) {
                                                 .iter()
                                                 .collect();
                                             let mut make_a_note = OpenOptions::new()
-                                                .create(true)        // Create the file if it doesn't exist
-                                                .append(true)        // Append to the end of the file
+                                                .create(true)  
+                                                .append(true)      
                                                 .open(notes_path)
                                                 .expect("Failed to open file");
 
@@ -936,7 +923,6 @@ fn build_ui(app: &Application) {
                                                 .write_all(format!("\n{}\n>\n alterAi \n>\n{}\n\n{}\n{}\n",line, datetime_am_pm, strip_markdown_symbols(&last.content), line).as_bytes())
                                                 .expect("Failed to write to file");
 
-                                            //println!("Saved:\n{}", last.content);
                                             inp.set_text("");
                                             let save_message = Label::new(Some("Saved Previous reply"));
                                             save_message.set_widget_name("save_info");
@@ -962,7 +948,6 @@ fn build_ui(app: &Application) {
                                         airep.set_selectable(true);
                                         airep.set_widget_name("ai_reply");
                                         
-
                                         let user_inp = Label::new(Some(""));
                                         user_inp.set_wrap(true);
                                         user_inp.set_max_width_chars(50);
@@ -999,7 +984,6 @@ fn build_ui(app: &Application) {
                                                     
 
                                                     ai_typing_effect(&airep, &strip_markdown_symbols(&ai_reply), 5, &ai, &clo);
-                                                    // println!("Response: {}", ai_reply);
 
                                                 }
                                                 Err(err) => {
