@@ -511,7 +511,7 @@ fn build_ui(app: &Application) {
                 }
                 _res_flag = true;
             } else if text_in_entry == "`"{ 
-                info.set_text("open Marker\nThe alternative notes");
+                info.set_markup("<i>~t</i> for Time\n<i>~b</i> for Battery\n<i>~m</i> for aiNotes (/s in alterAi)");
                 _res_flag = true;
             } else if text_in_entry == "!"{
                 info.set_text("");
@@ -519,7 +519,7 @@ fn build_ui(app: &Application) {
                 _res_flag = true;
                 info.set_widget_name("info_lable-card");
             } else {
-                info.set_text(" type\n` for marker\n ! for alterAi");
+                info.set_text(" type\n ` for flags\n ! for alterAi");
                 _res_flag = false;
                 info.set_widget_name("info_lable-card");
             }
@@ -1284,7 +1284,7 @@ fn collect_desktop_apps<P: AsRef<Path>>(dir: P, pairs: &mut Vec<(String, String)
 }
 
 fn lister(input: &str) -> (Mode, Vec<String>, Vec<String>) {
-    if input.starts_with('`') {
+    if input.starts_with("~m") {
         return (Mode::Notes, vec![format!("Open Marker")], vec![input.to_string()]);
     }
 
