@@ -624,8 +624,7 @@ fn build_ui(app: &Application) {
 
 
                              if let (Some(exec), Some(icon)) = (exec_line, icon) {
-                                let home_dir = std::env::var("HOME").unwrap_or_default();
-                                let qlpath: std::path::PathBuf = [home_dir.as_str(), ".config/alt/ql.dat"].iter().collect();
+                                let qlpath = format!("/var/lib/cynager/ql.dat");
                                 let ql_info = ql_info.clone();
 
                                 let mut existing = String::new();
