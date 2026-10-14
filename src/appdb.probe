@@ -1,0 +1,49 @@
+:mon
+    1 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    2 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    3 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    4 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    5 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    6 :{
+        app1 :1
+        app2 :2
+        app3 :3
+        so on
+    }
+    till 24 for 24 hrs in monday
+:end
+
+:tue
+    same 
+:end
+
+and so on till sunday
+
+:appfuzz
+    keep this empty for now
+:end
