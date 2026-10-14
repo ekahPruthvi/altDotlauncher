@@ -1,17 +1,17 @@
 [package]
 name = "altDot"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 authors = ["ekahPruthvi <ekahpdp@gmail.com>"]
 description = "An alternate dynamicLauncher"
 license = "GPL-3.0"
-repository = "https://github.com/ekahPruthvi/alt.git"
+repository = "https://github.com/ekahPruthvi/altDotlauncher.git"
 
 [dependencies]
 chrono = "0.4.41"
 fuzzy-matcher = "0.3.7"
 glob = "0.3.2"
 groq-api-rust = "0.2.51"
-gtk4 = "0.9.6"
+gtk4 = "0.11.5"
+gtk4-layer-shell = "0.8.1"
 tokio = { version = "1.45.0", features = ["full"] }
-vte4 = "0.8.0"
