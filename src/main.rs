@@ -7,40 +7,43 @@ use gtk4::{
     SelectionMode,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use serde::{Deserialize, Serialize};
+use infoprober::{Document, Entry};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
-const MAX_SESSIONS_PER_APP: usize = 1000;
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct Session {
-    start: u64, 
-    end: u64, 
-}
+const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
-#[derive(Serialize, Deserialize, Clone, Default)]
 struct Usage {
-    total_secs: u64,
-    sessions: Vec<Session>,
-    #[serde(skip)]
-    open_since: Option<u64>,
+    slots: Vec<HashMap<String, u32>>,
+    alive: HashMap<String, usize>,
+    dirty: bool,
 }
 
-type UsageMap = Arc<Mutex<HashMap<String, Usage>>>;
+impl Usage {
+    fn new() -> Self {
+        Self {
+            slots: vec![HashMap::new(); 7 * 24],
+            alive: HashMap::new(),
+            dirty: false,
+        }
+    }
+}
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+type UsageMap = Arc<Mutex<Usage>>;
+
+fn current_slot() -> Option<usize> {
+    let dt = glib::DateTime::now_local().ok()?;
+    let day = (dt.day_of_week() - 1).clamp(0, 6) as usize;
+    let hour = dt.hour().clamp(0, 23) as usize;
+    Some(day * 24 + hour)
 }
 
 fn usage_path() -> PathBuf {
@@ -49,25 +52,91 @@ fn usage_path() -> PathBuf {
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
         });
-    base.join("alt").join("appMon.json")
+    base.join("alt").join("appMon.probe")
 }
 
-fn load_usage() -> HashMap<String, Usage> {
-    std::fs::read_to_string(usage_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+fn load_usage() -> Usage {
+    let mut usage = Usage::new();
+
+    let Ok(src) = std::fs::read_to_string(usage_path()) else {
+        return usage;
+    };
+    let doc = match infoprober::parse(&src) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("appMon.probe: {e}");
+            return usage;
+        }
+    };
+
+    for (d, name) in DAYS.iter().enumerate() {
+        let Some(section) = doc.section(name) else {
+            continue;
+        };
+        for hour_entry in &section.entries {
+            let Some(hour) = hour_entry.key.parse::<usize>().ok() else {
+                continue;
+            };
+            if !(1..=24).contains(&hour) {
+                continue;
+            }
+            let Some(apps) = hour_entry.value.as_map() else {
+                continue;
+            };
+            let slot = &mut usage.slots[d * 24 + (hour - 1)];
+            for app in apps {
+                if let Some(n) = app.value.parse::<u32>() {
+                    slot.insert(app.key.to_string(), n);
+                }
+            }
+        }
+    }
+    usage
 }
 
-fn save_usage(map: &HashMap<String, Usage>) {
+fn save_usage(usage: &Usage) {
     let path = usage_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(json) = serde_json::to_string(map) {
-        let _ = std::fs::write(path, json);
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = match infoprober::parse(&existing) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("appMon.probe is malformed ({e}); backing it up to .bak");
+            let _ = std::fs::copy(&path, path.with_extension("probe.bak"));
+            Document::new()
+        }
+    };
+
+    for (d, name) in DAYS.iter().enumerate() {
+        let section = doc.section_or_insert(*name);
+        section.entries.clear();
+
+        for h in 0..24 {
+            let mut apps: Vec<(&String, &u32)> = usage.slots[d * 24 + h].iter().collect();
+            apps.sort();
+            let entries: Vec<Entry> = apps
+                .into_iter()
+                .map(|(k, v)| Entry::new(k.clone(), v.to_string()))
+                .collect();
+            section.push((h + 1).to_string(), entries);
+        }
+    }
+    doc.section_or_insert("appfuzz");
+
+    if let Err(e) = doc.validate() {
+        eprintln!("appMon.probe not saved: {e}");
+        return;
+    }
+
+    let tmp = path.with_extension("probe.tmp");
+    if std::fs::write(&tmp, doc.render()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
+
 
 fn extend_data_dirs() {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -143,7 +212,6 @@ fn build_resolver(apps: &[AppInfo]) -> HashMap<String, String> {
     map
 }
 
-
 fn niri_open_app_ids() -> Option<HashSet<String>> {
     let out = Command::new("niri")
         .args(["msg", "--json", "windows"])
@@ -161,18 +229,18 @@ fn niri_open_app_ids() -> Option<HashSet<String>> {
     Some(set)
 }
 
+
 fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
     std::thread::spawn(move || {
-        let mut last_poll = now();
-        let mut last_save = now();
+        let mut last_save = std::time::Instant::now();
 
         loop {
             std::thread::sleep(Duration::from_secs(POLL_SECS));
-            let t = now();
-            let dt = t.saturating_sub(last_poll);
-            last_poll = t;
 
             let Some(open_ids) = niri_open_app_ids() else {
+                continue;
+            };
+            let Some(slot) = current_slot() else {
                 continue;
             };
 
@@ -181,26 +249,23 @@ fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
                 .filter_map(|app_id| resolver.get(app_id))
                 .collect();
 
-            let mut map = usage.lock().unwrap();
+            let mut guard = usage.lock().unwrap();
+            let u = &mut *guard;
 
-            for (id, u) in map.iter_mut() {
-                if running.contains(id) {
-                    if u.open_since.is_none() {
-                        u.open_since = Some(t);
-                    }
-                    u.total_secs += dt;
-                } else if let Some(start) = u.open_since.take() {
-                    u.sessions.push(Session { start, end: t });
-                    if u.sessions.len() > MAX_SESSIONS_PER_APP {
-                        let excess = u.sessions.len() - MAX_SESSIONS_PER_APP;
-                        u.sessions.drain(0..excess);
-                    }
+            u.alive.retain(|id, _| running.contains(id));
+
+            for id in running {
+                if u.alive.get(id).copied() != Some(slot) {
+                    *u.slots[slot].entry(id.clone()).or_insert(0) += 1;
+                    u.alive.insert(id.clone(), slot);
+                    u.dirty = true;
                 }
             }
 
-            if t.saturating_sub(last_save) >= SAVE_EVERY_SECS {
-                save_usage(&map);
-                last_save = t;
+            if u.dirty && last_save.elapsed().as_secs() >= SAVE_EVERY_SECS {
+                save_usage(u);
+                u.dirty = false;
+                last_save = std::time::Instant::now();
             }
         }
     });
@@ -248,7 +313,7 @@ fn spawn_super_watchers(tx: Sender<()>) {
                                 }
                                 meta_down = false;
                             }
-                            _ => {}
+                            _ => {} 
                         }
                     } else if value == 1 && meta_down {
                         clean = false;
@@ -258,6 +323,8 @@ fn spawn_super_watchers(tx: Sender<()>) {
         });
     }
 }
+
+// ───────────────────────── UI ─────────────────────────
 
 fn populate(grid: &FlowBox, window: &ApplicationWindow) {
     while let Some(child) = grid.first_child() {
@@ -366,7 +433,6 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
     (window, grid)
 }
 
-
 fn main() -> glib::ExitCode {
     extend_data_dirs();
 
@@ -376,17 +442,9 @@ fn main() -> glib::ExitCode {
 
     app.connect_startup(|app| {
         std::mem::forget(app.hold());
-
         let apps = load_apps();
         let resolver = build_resolver(&apps);
-
-        let mut stats = load_usage();
-        for a in &apps {
-            if let Some(id) = a.id() {
-                stats.entry(id.to_string()).or_default();
-            }
-        }
-        let usage: UsageMap = Arc::new(Mutex::new(stats));
+        let usage: UsageMap = Arc::new(Mutex::new(load_usage()));
         spawn_tracker(resolver, usage);
 
         let (window, grid) = build_window(app);
@@ -411,7 +469,6 @@ fn main() -> glib::ExitCode {
                 toggle_for_keys();
             }
         });
-
         let action = gio::SimpleAction::new("toggle", None);
         action.connect_activate(move |_, _| toggle());
         app.add_action(&action);

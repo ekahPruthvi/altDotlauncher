@@ -19,7 +19,7 @@ checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
 name = "altDot"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "async-channel",
  "chrono",
@@ -29,7 +29,7 @@ dependencies = [
  "groq-api-rust",
  "gtk4",
  "gtk4-layer-shell",
- "serde",
+ "infoprober",
  "serde_json",
  "tokio",
 ]
@@ -1051,6 +1051,12 @@ dependencies = [
  "equivalent",
  "hashbrown",
 ]
+
+[[package]]
+name = "infoprober"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e93b7305d4a27801bdea8c040e31f799c119eda7ac91c8ee6a4dd3fc01b70825"
 
 [[package]]
 name = "ipnet"
