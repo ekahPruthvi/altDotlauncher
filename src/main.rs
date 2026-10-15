@@ -54,6 +54,44 @@ fn current_slot() -> Option<usize> {
     Some(day * 24 + hour)
 }
 
+///   echo "firefox" > "$XDG_RUNTIME_DIR/altDot.search" && pkill -USR2 altDot
+fn search_request_path() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("altDot.search")
+}
+
+static SIG_TOGGLE: AtomicBool = AtomicBool::new(false);
+static SIG_SEARCH: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigusr1(_: libc::c_int) {
+    SIG_TOGGLE.store(true, Ordering::SeqCst);
+}
+
+extern "C" fn on_sigusr2(_: libc::c_int) {
+    SIG_SEARCH.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as libc::sighandler_t);
+    }
+}
+
+fn take_search_request() -> Option<String> {
+    let path = search_request_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let q = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if q.is_empty() {
+        None
+    } else {
+        Some(q)
+    }
+}
+
 fn usage_path() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -502,8 +540,31 @@ fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) 
 
 fn top_apps(usage: &UsageMap, slot: usize, n: usize) -> Vec<String> {
     let guard = usage.lock().unwrap();
-    let mut v: Vec<(&String, &u32)> = guard.slots[slot].iter().collect();
-    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    let total = guard.slots.len();
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let prev = (slot + total - 1) % total;
+    let next = (slot + 1) % total;
+    let mut sums: HashMap<&String, (u64, u32)> = HashMap::new();
+    for s in [prev, slot, next] {
+        for (id, &count) in &guard.slots[s] {
+            let e = sums.entry(id).or_insert((0, 0));
+            e.0 += count as u64;
+            if s == slot {
+                e.1 = count;
+            }
+        }
+    }
+
+    let mut v: Vec<(&String, (u64, u32))> = sums.into_iter().collect();
+    v.sort_by(|a, b| {
+        b.1 .0
+            .cmp(&a.1 .0)
+            .then(b.1 .1.cmp(&a.1 .1))
+            .then(a.0.cmp(b.0))
+    });
     v.into_iter().take(n).map(|(k, _)| k.clone()).collect()
 }
 
@@ -761,8 +822,6 @@ struct SearchUi {
     apps_title: Label,
     scroller: ScrolledWindow,
     mode_panel: GtkBox,
-    /// Always-focusable widget that keeps keyboard focus inside the window when the
-    /// search entry is hidden, so typing keeps reaching the key handler.
     anchor: GtkBox,
 }
 
@@ -1385,6 +1444,30 @@ fn main() -> glib::ExitCode {
                 toggle_for_keys();
             }
         });
+        install_signal_handlers();
+        {
+            let t = toggle.clone();
+            let window = window.clone();
+            let search = search.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                if SIG_TOGGLE.swap(false, Ordering::SeqCst) {
+                    t();
+                }
+                if SIG_SEARCH.swap(false, Ordering::SeqCst) {
+                    if !window.is_visible() {
+                        t();
+                    }
+                    if let Some(q) = take_search_request() {
+                        search.enter();
+                        search.entry.grab_focus();
+                        search.entry.set_text(&q);
+                        search.entry.set_position(-1);
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
         let action = gio::SimpleAction::new("toggle", None);
         action.connect_activate(move |_, _| toggle());
         app.add_action(&action);
