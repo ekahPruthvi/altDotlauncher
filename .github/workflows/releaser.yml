@@ -1,0 +1,33 @@
+name: Release altDot Binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Rust Binary in Arch Docker
+        run: |
+          docker run --rm -v $(pwd):/workspace -w /workspace archlinux:latest bash -c "
+            pacman -Syu --noconfirm base-devel rust gtk4 gtk4-layer-shell pkgconf alsa-lib pulseaudio
+            cargo build --release
+          "
+
+      - name: Compress Binary
+        run: |
+          tar -czvf altDot-x86_64.tar.gz -C target/release/ altDot
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: altDot-x86_64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
