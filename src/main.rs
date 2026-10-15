@@ -759,6 +759,9 @@ struct SearchUi {
     apps_title: Label,
     scroller: ScrolledWindow,
     mode_panel: GtkBox,
+    /// Always-focusable widget that keeps keyboard focus inside the window when the
+    /// search entry is hidden, so typing keeps reaching the key handler.
+    anchor: GtkBox,
 }
 
 impl SearchUi {
@@ -783,6 +786,7 @@ impl SearchUi {
         self.apps_title.set_visible(true);
         self.scroller.set_visible(true);
         self.mode_panel.set_visible(false);
+        self.anchor.grab_focus();
     }
 }
 
@@ -934,6 +938,7 @@ fn build_window(
     let card = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
         .css_classes(["win-card"])
+        .focusable(true)
         .build();
     card.append(&topbox);
     card.append(&allappstitle);
@@ -955,6 +960,7 @@ fn build_window(
         apps_title: allappstitle,
         scroller: scroller.clone(),
         mode_panel,
+        anchor: card.clone(),
     };
 
     let overlay = Overlay::new();
@@ -1064,6 +1070,11 @@ fn build_window(
 
         .win, .backDrop {
             background: transparent;
+        }
+
+        .win-card:focus,
+        .win-card:focus-visible {
+            outline: none;
         }
 
         .win-card {
@@ -1268,6 +1279,7 @@ fn main() -> glib::ExitCode {
                     refresh_suggestions(&suggestionbox, &window, &usage);
                     bd.present();
                     window.present();
+                    search.anchor.grab_focus();
                 }
             }
         };
