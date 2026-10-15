@@ -3,7 +3,7 @@ use gtk4::gdk::Display;
 use gtk4::gio::{self, AppInfo};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Button, CssProvider, FlowBox, IconTheme, Image, Label,
+    glib, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image, Label,
     Overlay, Picture, ScrolledWindow, SelectionMode, Box as GtkBox,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -20,6 +20,9 @@ use std::time::Duration;
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
 const SUGGEST_COUNT: usize = 5;
+const SEARCH_RESULTS: usize = 3;
+const LOGO_TEXT: &str = "alt●";
+const SEARCH_GLYPH: &str = "";
 const LAUNCH_ANIM_US: i64 = 300_000;
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
@@ -274,7 +277,6 @@ fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
     });
 }
 
-/// Shared between every keyboard/pointer watcher thread.
 struct SuperState {
     down: AtomicBool,
     clean: AtomicBool,
@@ -286,7 +288,6 @@ fn spawn_super_watchers(tx: Sender<()>) {
     let left = KeyCode::KEY_LEFTMETA.code();
     let right = KeyCode::KEY_RIGHTMETA.code();
 
-    // codes on pointer devices that do NOT count as a "click" (plain finger on a touchpad)
     let touch = KeyCode::BTN_TOUCH.0;
     let finger = KeyCode::BTN_TOOL_FINGER.0;
     let wheel = [
@@ -360,9 +361,7 @@ fn spawn_super_watchers(tx: Sender<()>) {
                     }
                     let (code, value) = (ev.code(), ev.value());
                     let taints = match ev.event_type() {
-                        // mouse buttons, touchpad clicks, 2/3-finger gestures
                         EventType::KEY => value == 1 && code != touch && code != finger,
-                        // scroll wheel
                         EventType::RELATIVE => wheel.contains(&code),
                         _ => false,
                     };
@@ -395,8 +394,6 @@ fn make_app_button(info: AppInfo, window: &ApplicationWindow) -> Button {
     button
 }
 
-/// Remove any leftover launch ghost and restore the card (e.g. if the window was
-/// hidden mid-animation).
 fn reset_launch(window: &ApplicationWindow) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
         return;
@@ -418,8 +415,6 @@ fn reset_launch(window: &ApplicationWindow) {
     }
 }
 
-/// Launch the app, then grow its icon from the clicked button to fill the whole window
-/// while the launcher fades out; hide the window when the animation ends.
 fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
         let _ = info.launch(&[], None::<&gio::AppLaunchContext>);
@@ -457,7 +452,6 @@ fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) 
         gtk4::IconLookupFlags::empty(),
     );
 
-    // start rect = the 56px icon centred in the clicked button
     let side = 56.0_f32;
     let x0 = b.x() + (b.width() - side) / 2.0;
     let y0 = b.y() + (b.height() - side) / 2.0;
@@ -484,7 +478,7 @@ fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) 
             start.set(now);
         }
         let t = ((now - start.get()) as f64 / LAUNCH_ANIM_US as f64).clamp(0.0, 1.0);
-        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        let e = 1.0 - (1.0 - t).powi(3);
         let shrink = |v: f32| (v as f64 * (1.0 - e)).round().max(0.0) as i32;
 
         g.set_margin_start(shrink(ms));
@@ -536,7 +530,7 @@ fn refresh_suggestions(suggbox: &GtkBox, window: &ApplicationWindow, usage: &Usa
 
             let cell = GtkBox::builder()
                 .orientation(gtk4::Orientation::Vertical)
-                .spacing(2)
+                .spacing(5)
                 .halign(gtk4::Align::Center)
                 .hexpand(false)
                 .build();
@@ -606,6 +600,192 @@ fn launch_suggestion(suggbox: &GtkBox, index: usize) -> bool {
     true
 }
 
+fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
+    let q_lower = query.trim().to_lowercase();
+    let q: Vec<char> = q_lower.chars().filter(|c| !c.is_whitespace()).collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+
+    let mut score = 0_i32;
+    let mut ti = 0_usize;
+    let mut prev: Option<usize> = None;
+
+    for &qc in &q {
+        let mut found = None;
+        while ti < t.len() {
+            if t[ti] == qc {
+                found = Some(ti);
+                ti += 1;
+                break;
+            }
+            ti += 1;
+        }
+        let pos = found?;
+
+        score += 10;
+        match prev {
+            Some(p) if pos == p + 1 => score += 15,
+            Some(p) => score -= (pos - p - 1).min(10) as i32,
+            None => score -= pos.min(10) as i32,
+        }
+        if pos == 0 || !t[pos - 1].is_alphanumeric() {
+            score += 12;
+        }
+        prev = Some(pos);
+    }
+
+    let haystack: String = t.iter().collect();
+    if haystack.contains(&q_lower) {
+        score += 40;
+        if haystack.starts_with(&q_lower) {
+            score += 30;
+        }
+    }
+    score -= t.len() as i32 / 8;
+    Some(score)
+}
+
+fn result_cells(suggbox: &GtkBox) -> Vec<gtk4::Widget> {
+    let mut cells = Vec::new();
+    if let Some(row) = suggbox.first_child() {
+        let mut c = row.first_child();
+        while let Some(w) = c {
+            c = w.next_sibling();
+            cells.push(w);
+        }
+    }
+    cells
+}
+
+fn selected_result(suggbox: &GtkBox) -> usize {
+    result_cells(suggbox)
+        .iter()
+        .position(|c| c.has_css_class("sugg-top"))
+        .unwrap_or(0)
+}
+
+fn move_selection(suggbox: &GtkBox, delta: i32) {
+    let cells = result_cells(suggbox);
+    if cells.is_empty() {
+        return;
+    }
+    let cur = cells
+        .iter()
+        .position(|c| c.has_css_class("sugg-top"))
+        .unwrap_or(0);
+    let next = (cur as i32 + delta).rem_euclid(cells.len() as i32) as usize;
+    cells[cur].remove_css_class("sugg-top");
+    cells[next].add_css_class("sugg-top");
+}
+
+fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
+    while let Some(child) = suggbox.first_child() {
+        suggbox.remove(&child);
+    }
+
+    let mut scored: Vec<(i32, AppInfo)> = load_apps()
+        .into_iter()
+        .filter_map(|a| {
+            let by_name = fuzzy_score(query, &a.display_name());
+            let by_id = a
+                .id()
+                .and_then(|id| fuzzy_score(query, id.as_str().trim_end_matches(".desktop")));
+            let s = match (by_name, by_id) {
+                (Some(x), Some(y)) => x.max(y - 20),
+                (Some(x), None) => x,
+                (None, Some(y)) => y - 20,
+                (None, None) => return None,
+            };
+            Some((s, a))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0).then_with(|| {
+            a.1.display_name()
+                .to_lowercase()
+                .cmp(&b.1.display_name().to_lowercase())
+        })
+    });
+    scored.truncate(SEARCH_RESULTS);
+
+    if scored.is_empty() {
+        let none = Label::new(Some("No applications found"));
+        none.add_css_class("sugg-empty-sub");
+        none.set_halign(gtk4::Align::Start);
+        none.set_margin_start(10);
+        suggbox.append(&none);
+        return;
+    }
+
+    let row = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk4::Align::Center)
+        .build();
+
+    for (i, (_, info)) in scored.into_iter().enumerate() {
+        let cell = GtkBox::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(0)
+            .halign(gtk4::Align::Center)
+            .hexpand(false)
+            .build();
+
+        let button = make_app_button(info.clone(), window);
+        if i == 0 {
+            cell.add_css_class("sugg-top");
+        }
+        cell.append(&button);
+
+        let name = Label::new(Some(&info.display_name()));
+        name.add_css_class("sugg-name");
+        name.set_margin_end(25);
+        name.set_halign(gtk4::Align::Center);
+        cell.append(&name);
+
+        row.append(&cell);
+    }
+    suggbox.append(&row);
+}
+
+#[derive(Clone)]
+struct SearchUi {
+    entry: GtkEntry,
+    logo: Label,
+    sugg_title: Label,
+    apps_title: Label,
+    scroller: ScrolledWindow,
+    mode_panel: GtkBox,
+}
+
+impl SearchUi {
+    fn active(&self) -> bool {
+        WidgetExt::is_visible(&self.entry)
+    }
+
+    fn enter(&self) {
+        self.logo.set_text(SEARCH_GLYPH);
+        self.entry.set_visible(true);
+        self.sugg_title.set_text("Applications");
+        self.apps_title.set_visible(false);
+        self.scroller.set_visible(false);
+        self.mode_panel.set_visible(true);
+    }
+
+    fn exit(&self) {
+        self.entry.set_visible(false);
+        self.entry.set_text("");
+        self.logo.set_text(LOGO_TEXT);
+        self.sugg_title.set_text("Suggestions");
+        self.apps_title.set_visible(true);
+        self.scroller.set_visible(true);
+        self.mode_panel.set_visible(false);
+    }
+}
+
 fn populate(grid: &FlowBox, window: &ApplicationWindow) {
     while let Some(child) = grid.first_child() {
         grid.remove(&child);
@@ -632,7 +812,10 @@ fn animate_on_map(win: &ApplicationWindow, target: &gtk4::Box) {
     win.connect_unmap(move |_| t.remove_css_class("enter"));
 }
 
-fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, FlowBox, GtkBox) {
+fn build_window(
+    app: &Application,
+    usage: &UsageMap,
+) -> (ApplicationWindow, ApplicationWindow, FlowBox, GtkBox, SearchUi) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("alt.")
@@ -681,7 +864,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .max_children_per_line(5)
         .row_spacing(25)
         .column_spacing(25)
-        .margin_top(30)
+        .margin_top(10)
         .margin_bottom(30)
         .margin_start(20)
         .margin_end(20)
@@ -699,6 +882,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
     let topbox = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(5)
+        .hexpand(true)
         .css_classes(["topboxy"])
         .build();
 
@@ -708,10 +892,20 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .css_classes(["winheader"])
         .build();
 
-    let altdotlabel = Label::new(Some("alt●"));
+    let altdotlabel = Label::new(Some(LOGO_TEXT));
     altdotlabel.set_margin_start(10);
     altdotlabel.set_css_classes(&["altlogo"]);
     header.append(&altdotlabel);
+
+    let search_entry = GtkEntry::builder()
+        .placeholder_text("Search apps")
+        .has_frame(false)
+        .hexpand(true)
+        .visible(false)
+        .margin_start(10)
+        .css_classes(["search-entry"])
+        .build();
+    header.append(&search_entry);
 
     let suggestionbox = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -719,15 +913,49 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .css_classes(["suggapps"])
         .build();
 
+    let suggboxtitle = Label::new(Some("Suggestions"));
+    suggboxtitle.set_margin_start(10);
+    suggboxtitle.set_halign(gtk4::Align::Start);
+    suggboxtitle.set_hexpand(true);
+    suggboxtitle.set_css_classes(&["pagetitle"]);
+
     topbox.append(&header);
+    topbox.append(&suggboxtitle);
     topbox.append(&suggestionbox);
+
+    let allappstitle = Label::new(Some("App Library"));
+    allappstitle.set_margin_start(30);
+    allappstitle.set_margin_top(5);
+    allappstitle.set_halign(gtk4::Align::Start);
+    allappstitle.set_hexpand(true);
+    allappstitle.set_css_classes(&["pagetitle"]);
+
 
     let card = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
         .css_classes(["win-card"])
         .build();
     card.append(&topbox);
+    card.append(&allappstitle);
     card.append(&scroller);
+
+    let mode_panel = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .visible(false)
+        .css_classes(["mode-panel"])
+        .build();
+    card.append(&mode_panel);
+
+    let search = SearchUi {
+        entry: search_entry,
+        logo: altdotlabel,
+        sugg_title: suggboxtitle,
+        apps_title: allappstitle,
+        scroller: scroller.clone(),
+        mode_panel,
+    };
 
     let overlay = Overlay::new();
     overlay.set_child(Some(&card));
@@ -735,29 +963,93 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
     animate_on_map(&window, &card);
 
     let keys = gtk4::EventControllerKey::new();
-    let win = window.clone();
-    let sugg = suggestionbox.clone();
-    keys.connect_key_pressed(move |_, key, _, state| {
-        if key == gtk4::gdk::Key::Escape {
-            win.set_visible(false);
-            return glib::Propagation::Stop;
-        }
-
-        let blocked = gtk4::gdk::ModifierType::CONTROL_MASK
-            | gtk4::gdk::ModifierType::ALT_MASK
-            | gtk4::gdk::ModifierType::SUPER_MASK
-            | gtk4::gdk::ModifierType::META_MASK;
-        if !state.intersects(blocked) {
-            if let Some(n) = key.to_unicode().and_then(|c| c.to_digit(10)) {
-                if (1..=SUGGEST_COUNT as u32).contains(&n) && launch_suggestion(&sugg, (n - 1) as usize)
-                {
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let win = window.clone();
+        let sugg = suggestionbox.clone();
+        let ui = search.clone();
+        let u = usage.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if key == gtk4::gdk::Key::Escape {
+                if ui.active() {
+                    ui.exit();
+                    refresh_suggestions(&sugg, &win, &u);
+                } else {
+                    win.set_visible(false);
+                }
+                return glib::Propagation::Stop;
+            }
+            if ui.active() {
+                let step = match key {
+                    gtk4::gdk::Key::Left | gtk4::gdk::Key::Up => Some(-1),
+                    gtk4::gdk::Key::Right | gtk4::gdk::Key::Down => Some(1),
+                    _ => None,
+                };
+                if let Some(d) = step {
+                    move_selection(&sugg, d);
                     return glib::Propagation::Stop;
                 }
             }
-        }
-        glib::Propagation::Proceed
-    });
+
+            let blocked = gtk4::gdk::ModifierType::CONTROL_MASK
+                | gtk4::gdk::ModifierType::ALT_MASK
+                | gtk4::gdk::ModifierType::SUPER_MASK
+                | gtk4::gdk::ModifierType::META_MASK;
+            if !state.intersects(blocked) {
+                if let Some(c) = key
+                    .to_unicode()
+                    .filter(|c| !c.is_control() && !c.is_whitespace())
+                {
+                    if c.is_numeric() {
+                        if !ui.active() {
+                            if let Some(n) = c.to_digit(10) {
+                                if (1..=SUGGEST_COUNT as u32).contains(&n)
+                                    && launch_suggestion(&sugg, (n - 1) as usize)
+                                {
+                                    return glib::Propagation::Stop;
+                                }
+                            }
+                        }
+                        return glib::Propagation::Stop;
+                    }
+
+                    if !ui.active() {
+                        ui.enter();
+                        ui.entry.grab_focus();
+                        ui.entry.set_text(&c.to_string());
+                        ui.entry.set_position(-1);
+                        return glib::Propagation::Stop;
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+    }
     window.add_controller(keys);
+
+    {
+        let ui = search.clone();
+        let sg = suggestionbox.clone();
+        let w = window.clone();
+        let u = usage.clone();
+        search.entry.connect_changed(move |e| {
+            if !ui.active() {
+                return;
+            }
+            let q = e.text().to_string();
+            if q.trim().is_empty() {
+                ui.exit();
+                refresh_suggestions(&sg, &w, &u);
+            } else {
+                show_results(&sg, &w, &q);
+            }
+        });
+
+        let sg = suggestionbox.clone();
+        search.entry.connect_activate(move |_| {
+            launch_suggestion(&sg, selected_result(&sg));
+        });
+    }
 
     let display = Display::default().expect("no display");
     let slide_px = max_monitor_height(&display);
@@ -775,15 +1067,14 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         }
 
         .win-card {
-            background-color: rgba(18, 18, 18, 0.62);
+            background-color: rgba(47, 47, 47, 0.49);
             border-radius: 35px;
             border: 1px solid var(--pri-border);
-            overflow: hidden;
             opacity: 0;
         }
 
         .bd-fill {
-            background: linear-gradient(to bottom, #04040456, transparent);
+            background: linear-gradient(to bottom, #04040498, transparent);
             opacity: 0;
         }
 
@@ -816,7 +1107,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
             border: none;
         }
         .app-btn:hover {
-            background-color: rgba(124, 124, 124, 0.25);
+            background-color: rgba(255, 255, 255, 0.06);
         }
 
         scrollbar {
@@ -875,6 +1166,28 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
             color: rgba(253, 253, 253, 0.4);
         }
 
+        entry.search-entry {
+            background: none;
+            border: none;
+            box-shadow: none;
+            outline: none;
+            font-size: 16px;
+            color: rgba(253, 253, 253, 0.29);
+            padding: 0 6px;
+            min-height: 0;
+        }
+
+        .sugg-name {
+            font-size: 11px;
+            color: rgba(253, 253, 253, 0.29);
+            font-weight: 700;
+        }
+
+        .sugg-top {
+            border-radius: 25px;
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+
         .topboxy {
             padding: 20px;
             border-bottom: 1px solid var(--pri-border);
@@ -883,6 +1196,12 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .altlogo {
             font-size: 20px;
             font-weight: 800;
+            color: rgba(253, 253, 253, 0.29);
+        }
+
+        .pagetitle {
+            font-size: 14px;
+            font-weight: 300;
             color: rgba(253, 253, 253, 0.29);
         }
 
@@ -895,7 +1214,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    (window, bd, grid, suggestionbox)
+    (window, bd, grid, suggestionbox, search)
 }
 
 fn main() -> glib::ExitCode {
@@ -912,7 +1231,7 @@ fn main() -> glib::ExitCode {
         let usage: UsageMap = Arc::new(Mutex::new(load_usage()));
         spawn_tracker(resolver, usage.clone());
 
-        let (window, bd, grid, suggestionbox) = build_window(app);
+        let (window, bd, grid, suggestionbox, search) = build_window(app, &usage);
 
         let last_slot = Rc::new(Cell::new(current_slot()));
         {
@@ -920,12 +1239,15 @@ fn main() -> glib::ExitCode {
             let w = window.clone();
             let u = usage.clone();
             let last = last_slot.clone();
+            let ui = search.clone();
             refresh_suggestions(&sb, &w, &u);
             glib::timeout_add_seconds_local(30, move || {
                 let now = current_slot();
                 if now != last.get() {
                     last.set(now);
-                    refresh_suggestions(&sb, &w, &u);
+                    if !ui.active() {
+                        refresh_suggestions(&sb, &w, &u);
+                    }
                 }
                 glib::ControlFlow::Continue
             });
@@ -935,11 +1257,13 @@ fn main() -> glib::ExitCode {
             let window = window.clone();
             let suggestionbox = suggestionbox.clone();
             let usage = usage.clone();
+            let search = search.clone();
             move || {
                 if window.is_visible() {
                     window.set_visible(false);
                 } else {
                     reset_launch(&window);
+                    search.exit();
                     populate(&grid, &window);
                     refresh_suggestions(&suggestionbox, &window, &usage);
                     bd.present();
