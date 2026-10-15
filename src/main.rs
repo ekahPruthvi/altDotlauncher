@@ -356,7 +356,23 @@ fn populate(grid: &FlowBox, window: &ApplicationWindow) {
     }
 }
 
-fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
+fn max_monitor_height(display: &Display) -> i32 {
+    let monitors = display.monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok())
+        .map(|m| m.geometry().height())
+        .max()
+        .unwrap_or(1080)
+}
+
+fn animate_on_map(win: &ApplicationWindow, target: &gtk4::Box) {
+    let t = target.clone();
+    win.connect_map(move |_| t.add_css_class("enter"));
+    let t = target.clone();
+    win.connect_unmap(move |_| t.remove_css_class("enter"));
+}
+
+fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, FlowBox) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("alt.")
@@ -364,6 +380,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
         .default_height(560)
         .resizable(false)
         .decorated(false)
+        .css_classes(["win"])
         .build();
 
     window.init_layer_shell();
@@ -372,6 +389,30 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
     window.set_keyboard_mode(KeyboardMode::Exclusive);
     window.set_anchor(Edge::Top, true);
     window.set_margin(Edge::Top, 130);
+
+    let bd = ApplicationWindow::builder()
+        .application(app)
+        .title("altbd")
+        .fullscreened(true)
+        .decorated(false)
+        .css_classes(["backDrop"])
+        .build();
+
+    bd.init_layer_shell();
+    bd.set_layer(Layer::Overlay);
+    bd.set_namespace(Some("altBackdrop"));
+    bd.set_keyboard_mode(KeyboardMode::None);
+    bd.set_anchor(Edge::Top, true);
+    bd.set_anchor(Edge::Bottom, true);
+    bd.set_anchor(Edge::Right, true);
+    bd.set_anchor(Edge::Left, true);
+
+    let bd_fill = gtk4::Box::builder().css_classes(["bd-fill"]).build();
+    bd.set_child(Some(&bd_fill));
+    animate_on_map(&bd, &bd_fill);
+
+    let bd_for_hide = bd.clone();
+    window.connect_hide(move |_| bd_for_hide.set_visible(false));
 
     let grid = FlowBox::builder()
         .selection_mode(SelectionMode::None)
@@ -391,8 +432,14 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vscrollbar_policy(gtk4::PolicyType::Automatic)
         .child(&grid)
+        .hexpand(true)
+        .vexpand(true)
         .build();
-    window.set_child(Some(&scroller));
+
+    let card = gtk4::Box::builder().css_classes(["win-card"]).build();
+    card.append(&scroller);
+    window.set_child(Some(&card));
+    animate_on_map(&window, &card);
 
     let keys = gtk4::EventControllerKey::new();
     let win = window.clone();
@@ -405,14 +452,51 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
     });
     window.add_controller(keys);
 
+    let display = Display::default().expect("no display");
+    let slide_px = max_monitor_height(&display);
+
     let provider = CssProvider::new();
     provider.load_from_data(
-        r#"
-        window {
+        &r#"
+        .win, .backDrop {
+            background: transparent;
+        }
+
+        .win-card {
             background-color: rgba(18, 18, 18, 0.62);
             border-radius: 35px;
             border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+            opacity: 0;
         }
+
+        .bd-fill {
+            background: linear-gradient(to bottom, #04040456, transparent);
+            opacity: 0;
+        }
+
+        @keyframes win-zoom-out {
+            from { opacity: 0; transform: scale(1.08); }
+            to   { opacity: 1; transform: scale(1); }
+        }
+        .win-card.enter {
+            animation-name: win-zoom-out;
+            animation-duration: 140ms;
+            animation-timing-function: ease-out;
+            animation-fill-mode: both;
+        }
+
+        @keyframes bd-slide-down {
+            from { opacity: 0; transform: translateY(-__SLIDE__px); }
+            to   { opacity: 1; transform: translateY(0px); }
+        }
+        .bd-fill.enter {
+            animation-name: bd-slide-down;
+            animation-duration: 350ms;
+            animation-timing-function: ease-out;
+            animation-fill-mode: both;
+        }
+
         .app-btn {
             all: unset;
             padding: 12px;
@@ -422,16 +506,46 @@ fn build_window(app: &Application) -> (ApplicationWindow, FlowBox) {
         .app-btn:hover {
             background-color: rgba(124, 124, 124, 0.25);
         }
-        "#,
+
+        scrollbar {
+            all: unset;
+            background-color: transparent;    
+        }
+
+        scrollbar trough {
+            background-color: transparent; 
+        }
+
+        scrollbar trough:hover {
+            background-color: rgba(0, 0, 0, 0);
+        }
+
+        scrollbar range {
+            background-color: transparent;
+        }
+
+        scrollbar slider {
+            background-color: transparent;
+            border: 2px solid transparent;
+        }
+
+        scrollbar slider:hover {
+            background-color: transparent;
+        }
+
+        "#
+        .replace("__SLIDE__", &slide_px.to_string()),
     );
     gtk4::style_context_add_provider_for_display(
-        &Display::default().expect("no display"),
+        &display,
         &provider,
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    (window, grid)
+    (window, bd, grid)
 }
+
+// fix win scroll also
 
 fn main() -> glib::ExitCode {
     extend_data_dirs();
@@ -447,7 +561,7 @@ fn main() -> glib::ExitCode {
         let usage: UsageMap = Arc::new(Mutex::new(load_usage()));
         spawn_tracker(resolver, usage);
 
-        let (window, grid) = build_window(app);
+        let (window, bd, grid) = build_window(app);
 
         let toggle = {
             let window = window.clone();
@@ -456,6 +570,7 @@ fn main() -> glib::ExitCode {
                     window.set_visible(false);
                 } else {
                     populate(&grid, &window);
+                    bd.present();
                     window.present();
                 }
             }
