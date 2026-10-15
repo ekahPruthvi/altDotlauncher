@@ -3,8 +3,8 @@ use gtk4::gdk::Display;
 use gtk4::gio::{self, AppInfo};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Button, CssProvider, FlowBox, Image, ScrolledWindow,
-    SelectionMode,
+    glib, Application, ApplicationWindow, Button, CssProvider, FlowBox, IconTheme, Image, Label,
+    Overlay, Picture, ScrolledWindow, SelectionMode, Box as GtkBox,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
@@ -13,11 +13,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
+const SUGGEST_COUNT: usize = 5;
+const LAUNCH_ANIM_US: i64 = 300_000;
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
@@ -271,26 +274,49 @@ fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
     });
 }
 
+/// Shared between every keyboard/pointer watcher thread.
+struct SuperState {
+    down: AtomicBool,
+    clean: AtomicBool,
+}
+
 fn spawn_super_watchers(tx: Sender<()>) {
-    use evdev::{EventType, KeyCode};
+    use evdev::{EventType, KeyCode, RelativeAxisCode};
 
     let left = KeyCode::KEY_LEFTMETA.code();
     let right = KeyCode::KEY_RIGHTMETA.code();
 
+    // codes on pointer devices that do NOT count as a "click" (plain finger on a touchpad)
+    let touch = KeyCode::BTN_TOUCH.0;
+    let finger = KeyCode::BTN_TOOL_FINGER.0;
+    let wheel = [
+        RelativeAxisCode::REL_WHEEL.0,
+        RelativeAxisCode::REL_HWHEEL.0,
+        RelativeAxisCode::REL_WHEEL_HI_RES.0,
+        RelativeAxisCode::REL_HWHEEL_HI_RES.0,
+    ];
+
+    let state = Arc::new(SuperState {
+        down: AtomicBool::new(false),
+        clean: AtomicBool::new(false),
+    });
+
     for (_path, mut dev) in evdev::enumerate() {
-        let has_super = dev
+        let is_keyboard = dev
             .supported_keys()
             .map_or(false, |k| k.contains(KeyCode::KEY_LEFTMETA));
-        if !has_super {
-            continue;
-        }
+        let is_pointer = !is_keyboard
+            && (dev
+                .supported_keys()
+                .map_or(false, |k| k.contains(KeyCode::BTN_LEFT))
+                || dev
+                    .supported_relative_axes()
+                    .map_or(false, |r| r.contains(RelativeAxisCode::REL_WHEEL)));
 
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut meta_down = false;
-            let mut clean = false;
-
-            loop {
+        if is_keyboard {
+            let tx = tx.clone();
+            let st = state.clone();
+            std::thread::spawn(move || loop {
                 let events = match dev.fetch_events() {
                     Ok(e) => e,
                     Err(_) => break,
@@ -304,27 +330,281 @@ fn spawn_super_watchers(tx: Sender<()>) {
                     if code == left || code == right {
                         match value {
                             1 => {
-                                meta_down = true;
-                                clean = true;
+                                st.down.store(true, Ordering::SeqCst);
+                                st.clean.store(true, Ordering::SeqCst);
                             }
                             0 => {
-                                if meta_down && clean {
+                                if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst)
+                                {
                                     let _ = tx.send_blocking(());
                                 }
-                                meta_down = false;
+                                st.down.store(false, Ordering::SeqCst);
                             }
-                            _ => {} 
+                            _ => {}
                         }
-                    } else if value == 1 && meta_down {
-                        clean = false;
+                    } else if value == 1 && st.down.load(Ordering::SeqCst) {
+                        st.clean.store(false, Ordering::SeqCst);
                     }
                 }
-            }
-        });
+            });
+        } else if is_pointer {
+            let st = state.clone();
+            std::thread::spawn(move || loop {
+                let events = match dev.fetch_events() {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                for ev in events {
+                    if !st.down.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let (code, value) = (ev.code(), ev.value());
+                    let taints = match ev.event_type() {
+                        // mouse buttons, touchpad clicks, 2/3-finger gestures
+                        EventType::KEY => value == 1 && code != touch && code != finger,
+                        // scroll wheel
+                        EventType::RELATIVE => wheel.contains(&code),
+                        _ => false,
+                    };
+                    if taints {
+                        st.clean.store(false, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
     }
 }
 
 // ───────────────────────── UI ─────────────────────────
+
+fn make_app_button(info: AppInfo, window: &ApplicationWindow) -> Button {
+    let image = match info.icon() {
+        Some(icon) => Image::from_gicon(&icon),
+        None => Image::from_icon_name("application-x-executable"),
+    };
+    image.set_pixel_size(56);
+
+    let button = Button::builder().child(&image).build();
+    button.add_css_class("flat");
+    button.add_css_class("app-btn");
+    button.set_halign(gtk4::Align::Center);
+    button.set_tooltip_text(Some(&info.display_name()));
+
+    let win = window.clone();
+    button.connect_clicked(move |b| launch_animated(&info, b, &win));
+    button
+}
+
+/// Remove any leftover launch ghost and restore the card (e.g. if the window was
+/// hidden mid-animation).
+fn reset_launch(window: &ApplicationWindow) {
+    let Some(overlay) = window.child().and_downcast::<Overlay>() else {
+        return;
+    };
+    let mut ghosts = Vec::new();
+    let mut c = overlay.first_child();
+    while let Some(w) = c {
+        c = w.next_sibling();
+        if w.has_css_class("launch-ghost") {
+            ghosts.push(w);
+        }
+    }
+    for g in ghosts {
+        overlay.remove_overlay(&g);
+    }
+    overlay.remove_css_class("launching");
+    if let Some(card) = overlay.child() {
+        card.set_opacity(1.0);
+    }
+}
+
+/// Launch the app, then grow its icon from the clicked button to fill the whole window
+/// while the launcher fades out; hide the window when the animation ends.
+fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) {
+    let Some(overlay) = window.child().and_downcast::<Overlay>() else {
+        let _ = info.launch(&[], None::<&gio::AppLaunchContext>);
+        window.set_visible(false);
+        return;
+    };
+    if overlay.has_css_class("launching") {
+        return;
+    }
+
+    if let Err(e) = info.launch(&[], None::<&gio::AppLaunchContext>) {
+        eprintln!("Failed to launch {}: {}", info.display_name(), e);
+        window.set_visible(false);
+        return;
+    }
+
+    let (ow, oh) = (overlay.width(), overlay.height());
+    let (Some(card), Some(b)) = (overlay.child(), source.compute_bounds(&overlay)) else {
+        window.set_visible(false);
+        return;
+    };
+    if ow <= 0 || oh <= 0 {
+        window.set_visible(false);
+        return;
+    }
+
+    let icon: gio::Icon = info
+        .icon()
+        .unwrap_or_else(|| gio::ThemedIcon::new("application-x-executable").upcast());
+    let paintable = IconTheme::for_display(&source.display()).lookup_by_gicon(
+        &icon,
+        256,
+        overlay.scale_factor(),
+        overlay.direction(),
+        gtk4::IconLookupFlags::empty(),
+    );
+
+    // start rect = the 56px icon centred in the clicked button
+    let side = 56.0_f32;
+    let x0 = b.x() + (b.width() - side) / 2.0;
+    let y0 = b.y() + (b.height() - side) / 2.0;
+    let (ms, mt) = (x0, y0);
+    let (me, mb) = (ow as f32 - x0 - side, oh as f32 - y0 - side);
+
+    let ghost = Picture::for_paintable(&paintable);
+    ghost.add_css_class("launch-ghost");
+    ghost.set_can_target(false);
+    ghost.set_halign(gtk4::Align::Fill);
+    ghost.set_valign(gtk4::Align::Fill);
+    ghost.set_margin_start(ms.round() as i32);
+    ghost.set_margin_top(mt.round() as i32);
+    ghost.set_margin_end(me.round() as i32);
+    ghost.set_margin_bottom(mb.round() as i32);
+    overlay.add_overlay(&ghost);
+    overlay.add_css_class("launching");
+
+    let start = Cell::new(0_i64);
+    let win = window.clone();
+    ghost.add_tick_callback(move |g, clock| {
+        let now = clock.frame_time();
+        if start.get() == 0 {
+            start.set(now);
+        }
+        let t = ((now - start.get()) as f64 / LAUNCH_ANIM_US as f64).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        let shrink = |v: f32| (v as f64 * (1.0 - e)).round().max(0.0) as i32;
+
+        g.set_margin_start(shrink(ms));
+        g.set_margin_top(shrink(mt));
+        g.set_margin_end(shrink(me));
+        g.set_margin_bottom(shrink(mb));
+
+        g.set_opacity(if t < 0.6 { 1.0 } else { 1.0 - (t - 0.6) / 0.4 });
+        card.set_opacity(1.0 - (t * 1.6).min(1.0));
+
+        if t >= 1.0 {
+            win.set_visible(false);
+            reset_launch(&win);
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn top_apps(usage: &UsageMap, slot: usize, n: usize) -> Vec<String> {
+    let guard = usage.lock().unwrap();
+    let mut v: Vec<(&String, &u32)> = guard.slots[slot].iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    v.into_iter().take(n).map(|(k, _)| k.clone()).collect()
+}
+
+fn refresh_suggestions(suggbox: &GtkBox, window: &ApplicationWindow, usage: &UsageMap) {
+    while let Some(child) = suggbox.first_child() {
+        suggbox.remove(&child);
+    }
+    let ids = current_slot()
+        .map(|slot| top_apps(usage, slot, SUGGEST_COUNT))
+        .unwrap_or_default();
+    let apps = load_apps();
+
+    let row = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk4::Align::Center)
+        .build();
+
+    let mut shown = 0;
+    for id in ids {
+        if let Some(info) = apps
+            .iter()
+            .find(|a| a.id().map_or(false, |x| x.as_str() == id))
+        {
+            shown += 1;
+
+            let cell = GtkBox::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(2)
+                .halign(gtk4::Align::Center)
+                .hexpand(false)
+                .build();
+            cell.append(&make_app_button(info.clone(), window));
+
+            let idx = Label::new(Some(&shown.to_string()));
+            idx.add_css_class("sugg-idx");
+            idx.set_halign(gtk4::Align::Center);
+            cell.append(&idx);
+
+            row.append(&cell);
+        }
+    }
+
+    suggbox.set_visible(true);
+    if shown > 0 {
+        suggbox.append(&row);
+    } else {
+        let placeholder = GtkBox::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(12)
+            .margin_top(10)
+            .halign(gtk4::Align::Center)
+            .css_classes(["sugg-empty"])
+            .build();
+
+        let icon = Image::from_icon_name("missing");
+        icon.set_pixel_size(56);
+        placeholder.append(&icon);
+
+        let text = GtkBox::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(2)
+            .valign(gtk4::Align::Center)
+            .build();
+
+        let title = Label::new(Some("Indexing Suggestions..."));
+        title.set_halign(gtk4::Align::Start);
+        title.add_css_class("sugg-empty-title");
+        text.append(&title);
+
+        let sub = Label::new(Some("Keep using to get predicted suggestions"));
+        sub.set_halign(gtk4::Align::Start);
+        sub.add_css_class("sugg-empty-sub");
+        text.append(&sub);
+
+        placeholder.append(&text);
+        suggbox.append(&placeholder);
+    }
+}
+
+fn launch_suggestion(suggbox: &GtkBox, index: usize) -> bool {
+    let Some(row) = suggbox.first_child() else {
+        return false;
+    };
+    let mut cell = row.first_child();
+    for _ in 0..index {
+        cell = cell.and_then(|c| c.next_sibling());
+    }
+    let Some(button) = cell
+        .and_then(|c| c.first_child())
+        .and_then(|b| b.downcast::<Button>().ok())
+    else {
+        return false;
+    };
+    button.emit_clicked();
+    true
+}
 
 fn populate(grid: &FlowBox, window: &ApplicationWindow) {
     while let Some(child) = grid.first_child() {
@@ -332,27 +612,7 @@ fn populate(grid: &FlowBox, window: &ApplicationWindow) {
     }
 
     for info in load_apps() {
-        let image = match info.icon() {
-            Some(icon) => Image::from_gicon(&icon),
-            None => Image::from_icon_name("application-x-executable"),
-        };
-        image.set_pixel_size(56);
-
-        let button = Button::builder().child(&image).build();
-        button.add_css_class("flat");
-        button.add_css_class("app-btn");
-        button.set_halign(gtk4::Align::Center);
-        button.set_tooltip_text(Some(&info.display_name()));
-
-        let win = window.clone();
-        button.connect_clicked(move |_| {
-            if let Err(e) = info.launch(&[], None::<&gio::AppLaunchContext>) {
-                eprintln!("Failed to launch {}: {}", info.display_name(), e);
-            }
-            win.set_visible(false);
-        });
-
-        grid.insert(&button, -1);
+        grid.insert(&make_app_button(info, window), -1);
     }
 }
 
@@ -372,7 +632,7 @@ fn animate_on_map(win: &ApplicationWindow, target: &gtk4::Box) {
     win.connect_unmap(move |_| t.remove_css_class("enter"));
 }
 
-fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, FlowBox) {
+fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, FlowBox, GtkBox) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("alt.")
@@ -436,17 +696,64 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .vexpand(true)
         .build();
 
-    let card = gtk4::Box::builder().css_classes(["win-card"]).build();
+    let topbox = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(5)
+        .css_classes(["topboxy"])
+        .build();
+
+    let header = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(2)
+        .css_classes(["winheader"])
+        .build();
+
+    let altdotlabel = Label::new(Some("alt●"));
+    altdotlabel.set_margin_start(10);
+    altdotlabel.set_css_classes(&["altlogo"]);
+    header.append(&altdotlabel);
+
+    let suggestionbox = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(0)
+        .css_classes(["suggapps"])
+        .build();
+
+    topbox.append(&header);
+    topbox.append(&suggestionbox);
+
+    let card = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .css_classes(["win-card"])
+        .build();
+    card.append(&topbox);
     card.append(&scroller);
-    window.set_child(Some(&card));
+
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&card));
+    window.set_child(Some(&overlay));
     animate_on_map(&window, &card);
 
     let keys = gtk4::EventControllerKey::new();
     let win = window.clone();
-    keys.connect_key_pressed(move |_, key, _, _| {
+    let sugg = suggestionbox.clone();
+    keys.connect_key_pressed(move |_, key, _, state| {
         if key == gtk4::gdk::Key::Escape {
             win.set_visible(false);
             return glib::Propagation::Stop;
+        }
+
+        let blocked = gtk4::gdk::ModifierType::CONTROL_MASK
+            | gtk4::gdk::ModifierType::ALT_MASK
+            | gtk4::gdk::ModifierType::SUPER_MASK
+            | gtk4::gdk::ModifierType::META_MASK;
+        if !state.intersects(blocked) {
+            if let Some(n) = key.to_unicode().and_then(|c| c.to_digit(10)) {
+                if (1..=SUGGEST_COUNT as u32).contains(&n) && launch_suggestion(&sugg, (n - 1) as usize)
+                {
+                    return glib::Propagation::Stop;
+                }
+            }
         }
         glib::Propagation::Proceed
     });
@@ -458,6 +765,11 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
     let provider = CssProvider::new();
     provider.load_from_data(
         &r#"
+
+        :root {
+            --pri-border: rgba(255, 255, 255, 0.1);
+        }
+
         .win, .backDrop {
             background: transparent;
         }
@@ -465,7 +777,7 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         .win-card {
             background-color: rgba(18, 18, 18, 0.62);
             border-radius: 35px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid var(--pri-border);
             overflow: hidden;
             opacity: 0;
         }
@@ -533,6 +845,47 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
             background-color: transparent;
         }
 
+        .winheader {
+            padding: 0 0 5px 0;
+            border-bottom: 1px solid var(--pri-border);
+        }
+
+        .sugg-empty-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: rgba(253, 253, 253, 0.7);
+        }
+
+        .sugg-empty-sub {
+            font-size: 11px;
+            color: rgba(253, 253, 253, 0.4);
+        }
+
+        .sugg-empty image {
+            opacity: 0.5;
+        }
+
+        .sugg-idx {
+            padding: 5px;
+            min-width: 15px;
+            background-color: rgba(0, 0, 0, 0.53);
+            border-radius: 5px;
+            font-size: 11px;
+            font-weight: 600;
+            color: rgba(253, 253, 253, 0.4);
+        }
+
+        .topboxy {
+            padding: 20px;
+            border-bottom: 1px solid var(--pri-border);
+        }
+
+        .altlogo {
+            font-size: 20px;
+            font-weight: 800;
+            color: rgba(253, 253, 253, 0.29);
+        }
+
         "#
         .replace("__SLIDE__", &slide_px.to_string()),
     );
@@ -542,10 +895,8 @@ fn build_window(app: &Application) -> (ApplicationWindow, ApplicationWindow, Flo
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
-    (window, bd, grid)
+    (window, bd, grid, suggestionbox)
 }
-
-// fix win scroll also
 
 fn main() -> glib::ExitCode {
     extend_data_dirs();
@@ -559,17 +910,38 @@ fn main() -> glib::ExitCode {
         let apps = load_apps();
         let resolver = build_resolver(&apps);
         let usage: UsageMap = Arc::new(Mutex::new(load_usage()));
-        spawn_tracker(resolver, usage);
+        spawn_tracker(resolver, usage.clone());
 
-        let (window, bd, grid) = build_window(app);
+        let (window, bd, grid, suggestionbox) = build_window(app);
+
+        let last_slot = Rc::new(Cell::new(current_slot()));
+        {
+            let sb = suggestionbox.clone();
+            let w = window.clone();
+            let u = usage.clone();
+            let last = last_slot.clone();
+            refresh_suggestions(&sb, &w, &u);
+            glib::timeout_add_seconds_local(30, move || {
+                let now = current_slot();
+                if now != last.get() {
+                    last.set(now);
+                    refresh_suggestions(&sb, &w, &u);
+                }
+                glib::ControlFlow::Continue
+            });
+        }
 
         let toggle = {
             let window = window.clone();
+            let suggestionbox = suggestionbox.clone();
+            let usage = usage.clone();
             move || {
                 if window.is_visible() {
                     window.set_visible(false);
                 } else {
+                    reset_launch(&window);
                     populate(&grid, &window);
+                    refresh_suggestions(&suggestionbox, &window, &usage);
                     bd.present();
                     window.present();
                 }
