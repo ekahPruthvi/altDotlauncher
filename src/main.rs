@@ -16,6 +16,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::process::exit;
+use self_update::cargo_crate_version;
 
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
@@ -1228,8 +1230,99 @@ fn build_window(
     (window, bd, grid, suggestionbox, search)
 }
 
+struct UpdateOutcome {
+    updated: bool,
+    version: String,
+}
+
+const ALT_BIN_PATH: &str = "/usr/bin/altDot";
+
+fn ensure_writable(path: &str) -> Result<(), String> {
+    use std::ffi::CString;
+
+    let c_path = CString::new(path).map_err(|e| e.to_string())?;
+
+    let path_obj = std::path::Path::new(path);
+    if path_obj.exists() {
+        let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 };
+        if !writable {
+            return Err(format!(
+                "no write permission for '{}'. Try: sudo calibrate --update",
+                path
+            ));
+        }
+    }
+
+    if let Some(parent) = path_obj.parent() {
+        let c_parent = CString::new(parent.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
+        let dir_writable = unsafe { libc::access(c_parent.as_ptr(), libc::W_OK) == 0 };
+        if !dir_writable {
+            return Err(format!(
+                "no write permission for directory '{}'. Try: sudo calibrate --update",
+                parent.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_for_updates() -> Result<UpdateOutcome, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("ekahPruthvi")
+        .repo_name("altDotlauncher")
+        .bin_name("altDot")
+        .target("x86_64")
+        .bin_install_path(ALT_BIN_PATH)
+        .show_download_progress(true)
+        .no_confirm(true)
+        .current_version(cargo_crate_version!())
+        .build()?
+        .update()?;
+
+    Ok(UpdateOutcome {
+        updated: status.is_updated(),
+        version: status.version().to_string(),
+    })
+}
+
+fn run_update() -> i32 {
+    println!("Checking for updates...");
+
+    if let Err(msg) = ensure_writable(ALT_BIN_PATH) {
+        eprintln!("Cannot update calibrate: {}", msg);
+        return 1;
+    }
+
+    match check_for_updates() {
+        Ok(outcome) => {
+            if outcome.updated {
+                println!("calibrate updated to version {}", outcome.version);
+            } else {
+                println!("calibrate is already up to date ({})", outcome.version);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("Update failed: {}", e);
+            1
+        }
+    }
+}
+
 fn main() -> glib::ExitCode {
     extend_data_dirs();
+
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() > 1 && (args[1] == "--version" || args[1] == "-V") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        exit(1);
+    } else if args.len() > 1 && (args[1] == "--update" || args[1] == "-U") {
+        exit(run_update());
+    }
+
 
     let app = Application::builder()
         .application_id("ekah.scu.alt")
