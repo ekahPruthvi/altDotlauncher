@@ -37,7 +37,6 @@ const CLIP_PREVIEW_WIDTH: &str = "400";
 const CLIP_THUMB_CACHE: usize = 256;
 
 const CLIP_ENABLED: bool = true;
-const WEB_API_ENABLED: bool = true;
 const FILES_ENABLED: bool = true;
 const CLIP_ALL_MAX: usize = 200;
 const CLIP_IMG_MAX_BYTES: usize = 25_000_000;
@@ -1382,17 +1381,7 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
 }
 
 
-// ───────────────────── mode panel: Files / Web / Calc / Clipboard / Pills ─────────────────────
-
-fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            b' ' => "+".to_string(),
-            _ => format!("%{:02X}", b),
-        })
-        .collect()
-}
+// ───────────────────── mode panel: Files / Calc / Clipboard / Pills ─────────────────────
 
 fn copy_text(text: &str) {
     if let Some(d) = Display::default() {
@@ -1959,15 +1948,14 @@ struct Hit {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cat {
     Files,
-    Web,
     Calc,
     Clip,
     Pills,
 }
 
 impl Cat {
-    const ALL: [Cat; 5] = [Cat::Files, Cat::Web, Cat::Calc, Cat::Clip, Cat::Pills];
-    const HOME: [Cat; 5] = [Cat::Calc, Cat::Files, Cat::Clip, Cat::Pills, Cat::Web];
+    const ALL: [Cat; 4] = [Cat::Files, Cat::Calc, Cat::Clip, Cat::Pills];
+    const HOME: [Cat; 4] = [Cat::Calc, Cat::Files, Cat::Clip, Cat::Pills];
 
     fn idx(self) -> usize {
         self as usize
@@ -1976,7 +1964,6 @@ impl Cat {
     fn id(self) -> &'static str {
         match self {
             Cat::Files => "files",
-            Cat::Web => "web",
             Cat::Calc => "calc",
             Cat::Clip => "clip",
             Cat::Pills => "pills",
@@ -1986,7 +1973,6 @@ impl Cat {
     fn title(self) -> &'static str {
         match self {
             Cat::Files => "Files",
-            Cat::Web => "Web results",
             Cat::Calc => "Calculator",
             Cat::Clip => "Clipboard",
             Cat::Pills => "Pills",
@@ -2019,120 +2005,6 @@ fn file_hits(paths: Vec<PathBuf>, window: &ApplicationWindow) -> Vec<Hit> {
                 action: Rc::new(move || open_file_dialog(&win, &target)),
             }
         })
-        .collect()
-}
-
-fn web_hits(q: &str) -> Vec<Hit> {
-    let q = q.trim();
-    if q.is_empty() {
-        return Vec::new();
-    }
-    let uri = format!("https://duckduckgo.com/?q={}", url_encode(q));
-    vec![Hit {
-        title: format!("Search the web for “{q}”"),
-        subtitle: "duckduckgo.com".to_string(),
-        icon: custom_icon("web.svg", "applications-internet"),
-        thumb: None,
-        clip_line: None,
-        action: Rc::new(move || {
-            let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-        }),
-    }]
-}
-
-struct WebResult {
-    title: String,
-    url: String,
-    thumb: Option<ThumbPixels>,
-}
-
-fn fetch_thumb(url: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
-    const MAX: u64 = 400_000;
-    let resp = ureq::get(url).timeout(Duration::from_secs(4)).call().ok()?;
-    let mut buf = Vec::new();
-    resp.into_reader().take(MAX + 1).read_to_end(&mut buf).ok()?;
-    (buf.len() as u64 <= MAX).then_some(buf)
-}
-
-const INFO_PROBE_PATH: &str = "/var/lib/cynager/info.probe";
-
-fn read_api_key() -> Option<String> {
-    let src = std::fs::read_to_string(INFO_PROBE_PATH).ok()?;
-    let doc = match infoprober::parse(&src) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("info.probe: {e}");
-            return None;
-        }
-    };
-    let key = doc.get("set", "altDotapi")?.as_str()?.trim();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
-    }
-}
-
-fn search_web(q: &str, key: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
-    if !WEB_API_ENABLED {
-        return Vec::new();
-    }
-    if key.trim().is_empty() {
-        return Vec::new();
-    }
-
-    std::thread::sleep(Duration::from_millis(250));
-    if generation.load(Ordering::SeqCst) != mine {
-        return Vec::new();
-    }
-
-    let Ok(resp) = ureq::get("https://api.search.brave.com/res/v1/web/search")
-        .query("q", q)
-        .query("count", &PAGE_MAX.to_string())
-        .set("X-Subscription-Token", key)
-        .set("Accept", "application/json")
-        .timeout(Duration::from_secs(5))
-        .call()
-    else {
-        return Vec::new();
-    };
-    let Ok(v) = resp.into_json::<serde_json::Value>() else {
-        return Vec::new();
-    };
-
-    let items: Vec<(String, String, Option<String>)> = v["web"]["results"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .take(PAGE_MAX)
-                .filter_map(|r| {
-                    Some((
-                        r["title"].as_str()?.to_string(),
-                        r["url"].as_str()?.to_string(),
-                        r["thumbnail"]["src"].as_str().map(String::from),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if generation.load(Ordering::SeqCst) != mine {
-        return Vec::new();
-    }
-
-    let thumbs: Vec<Option<ThumbPixels>> = std::thread::scope(|s| {
-        let handles: Vec<_> = items
-            .iter()
-            .map(|(_, _, t)| s.spawn(move || t.as_deref().and_then(fetch_thumb).and_then(thumb_pixels)))
-            .collect();
-        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
-    });
-
-    items
-        .into_iter()
-        .zip(thumbs)
-        .map(|((title, url, _), thumb)| WebResult { title, url, thumb })
         .collect()
 }
 
@@ -2183,26 +2055,6 @@ fn thumb_pixels(bytes: Vec<u8>) -> Option<ThumbPixels> {
         alpha: flat.has_alpha(),
         data: flat.read_pixel_bytes().to_vec(),
     })
-}
-
-fn web_result_hits(q: &str, found: Vec<WebResult>) -> Vec<Hit> {
-    let mut hits = web_hits(q);
-    hits.extend(found.into_iter().map(|r| {
-        let host = r.url.split('/').nth(2).unwrap_or("").to_string();
-        let thumb = r.thumb.map(|t| t.into_texture());
-        let url = r.url;
-        Hit {
-            title: r.title,
-            subtitle: host,
-            icon: custom_icon("web.svg", "applications-internet"),
-            thumb,
-            clip_line: None,
-            action: Rc::new(move || {
-                let _ = AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
-            }),
-        }
-    }));
-    hits
 }
 
 fn calc_hits(q: &str) -> Vec<Hit> {
@@ -3251,7 +3103,6 @@ impl ModePanel {
         {
             let mut r = self.results.borrow_mut();
             r[Cat::Files.idx()].clear();
-            r[Cat::Web.idx()] = web_hits(&q);
             r[Cat::Calc.idx()] = calc_hits(&q);
             r[Cat::Clip.idx()].clear();
             r[Cat::Pills.idx()] = pill_hits(&q);
@@ -3353,29 +3204,6 @@ impl ModePanel {
             });
         }
 
-        let brave_key = if WEB_API_ENABLED { read_api_key() } else { None };
-        if let Some(key) = brave_key.filter(|key| !key.trim().is_empty()) {
-            let (tx, rx) = async_channel::bounded::<Vec<WebResult>>(1);
-            let generation = self.generation.clone();
-            let qq = q.clone();
-            let _ = std::thread::Builder::new()
-                .name("altdot-web-search".to_string())
-                .spawn(move || {
-                    let found = search_web(&qq, &key, &generation, mine);
-                    let _ = tx.send_blocking(found);
-                });
-
-            let panel = self.clone();
-            let qq = q.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(found) = rx.recv().await {
-                    if panel.generation.load(Ordering::SeqCst) == mine && !found.is_empty() {
-                        panel.results.borrow_mut()[Cat::Web.idx()] = web_result_hits(&qq, found);
-                        panel.render_cats(&[Cat::Web]);
-                    }
-                }
-            });
-        }
     }
 
     fn apply_thumbs(&self, batch: Vec<(String, ThumbPixels)>) {
