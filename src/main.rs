@@ -10,7 +10,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::rc::Rc;
@@ -37,16 +37,9 @@ const CLIP_KEEP: usize = 50;
 const CLIP_MAX_BYTES: usize = 10_000;
 const FILE_SKIP_DIRS: [&str; 5] = ["node_modules", "target", "venv", "__pycache__", "site-packages"];
 
-/// terminals offered for Terminal=true apps: (binary, args placed before the app's command)
 const TERMINALS: [(&str, &[&str]); 2] = [("kitty", &[]), ("xterm", &["-e"])];
 
-/// (label, icon, shell command) -- edit this list to add your own pills
-const PILLS: [(&str, &str, &str); 5] = [
-    ("Lock", "system-lock-screen", "loginctl lock-session"),
-    ("Suspend", "system-suspend", "systemctl suspend"),
-    ("Log out", "system-log-out", "niri msg action quit --skip-confirmation"),
-    ("Restart", "system-reboot", "systemctl reboot"),
-    ("Power off", "system-shutdown", "systemctl poweroff"),
+const PILLS: [(&str, &str, &str); 0] = [
 ];
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
@@ -479,7 +472,6 @@ fn installed_terminals() -> Vec<&'static str> {
     TERMINALS.iter().map(|(n, _)| *n).filter(|n| in_path(n)).collect()
 }
 
-/// the app's .desktop file, loaded the same way build_resolver does (no DesktopAppInfo needed)
 fn desktop_keyfile(info: &AppInfo) -> Option<glib::KeyFile> {
     let id = info.id()?;
     let kf = glib::KeyFile::new();
@@ -494,7 +486,6 @@ fn is_terminal_app(info: &AppInfo) -> bool {
         .unwrap_or(false)
 }
 
-/// minimal shell-style splitter for Exec= lines (quotes + backslashes)
 fn split_exec(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -544,21 +535,44 @@ fn split_exec(s: &str) -> Vec<String> {
     out
 }
 
-fn terminal_app_argv(info: &AppInfo) -> Option<Vec<String>> {
+fn terminal_app_argv(info: &AppInfo, file: Option<&Path>) -> Option<Vec<String>> {
     let kf = desktop_keyfile(info)?;
     let exec = kf.string("Desktop Entry", "Exec").ok()?.to_string();
-    let argv: Vec<String> = split_exec(&exec)
-        .into_iter()
-        .filter(|a| !(a.len() == 2 && a.starts_with('%') && !a.starts_with("%%")))
-        .map(|a| a.replace("%%", "%"))
-        .collect();
+    let path = file.map(|p| p.to_string_lossy().to_string());
+    let uri = file.map(|p| gio::File::for_path(p).uri().to_string());
+
+    let mut used = false;
+    let mut argv: Vec<String> = Vec::new();
+    for tok in split_exec(&exec) {
+        match tok.as_str() {
+            "%f" | "%F" => {
+                if let Some(p) = &path {
+                    argv.push(p.clone());
+                    used = true;
+                }
+            }
+            "%u" | "%U" => {
+                if let Some(u) = &uri {
+                    argv.push(u.clone());
+                    used = true;
+                }
+            }
+            t if t.len() == 2 && t.starts_with('%') && !t.starts_with("%%") => {}
+            t => argv.push(t.replace("%%", "%")),
+        }
+    }
+    if !used {
+        if let Some(p) = path {
+            argv.push(p);
+        }
+    }
     Some(argv)
 }
 
-fn run_app(info: &AppInfo, term: Option<&'static str>) -> Result<(), String> {
+fn run_app(info: &AppInfo, term: Option<&'static str>, file: Option<&Path>) -> Result<(), String> {
     match term {
         Some(t) => {
-            let argv = terminal_app_argv(info).ok_or_else(|| "no Exec line".to_string())?;
+            let argv = terminal_app_argv(info, file).ok_or_else(|| "no Exec line".to_string())?;
             if argv.is_empty() {
                 return Err("empty Exec line".to_string());
             }
@@ -571,9 +585,11 @@ fn run_app(info: &AppInfo, term: Option<&'static str>) -> Result<(), String> {
             cmd.args(flags).args(&argv);
             spawn_detached(&mut cmd).map_err(|e| e.to_string())
         }
-        None => info
-            .launch(&[], None::<&gio::AppLaunchContext>)
-            .map_err(|e| e.to_string()),
+        None => {
+            let files: Vec<gio::File> = file.map(gio::File::for_path).into_iter().collect();
+            info.launch(&files, None::<&gio::AppLaunchContext>)
+                .map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -611,65 +627,227 @@ fn collect_buttons(w: &gtk4::Widget, out: &mut Vec<Button>) {
     }
 }
 
-fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, terms: Vec<&'static str>) {
+struct PickOpt {
+    label: String,
+    icon: Option<gio::Icon>,
+    run: Rc<dyn Fn()>,
+}
+
+fn show_picker(window: &ApplicationWindow, title: &str, options: Vec<PickOpt>) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
-        start_launch(info, source, window, terms.first().copied());
         return;
     };
-    if picker_widget(window).is_some() {
+    if picker_widget(window).is_some() || options.is_empty() {
         return;
     }
 
     let picker = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
-        .spacing(12)
+        .spacing(8)
         .halign(gtk4::Align::Center)
         .valign(gtk4::Align::Center)
         .css_classes(["term-pick"])
         .build();
 
-    let title = Label::new(Some(&format!("Open {} with", info.display_name())));
-    title.add_css_class("term-pick-title");
-    picker.append(&title);
-
-    let row = GtkBox::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .spacing(10)
-        .halign(gtk4::Align::Center)
-        .build();
+    let head = Label::new(Some(title));
+    head.add_css_class("term-pick-title");
+    head.set_margin_bottom(4);
+    picker.append(&head);
 
     let mut first: Option<Button> = None;
-    for (i, t) in terms.iter().enumerate() {
-        let b = Button::with_label(&format!("{}  {}", i + 1, t));
+    for (i, opt) in options.into_iter().enumerate() {
+        let row = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).build();
+        if let Some(icon) = &opt.icon {
+            let img = Image::from_gicon(icon);
+            img.set_pixel_size(22);
+            row.append(&img);
+        }
+        let text = Label::new(Some(&format!("{}  {}", i + 1, opt.label)));
+        text.set_xalign(0.0);
+        row.append(&text);
+
+        let b = Button::builder().child(&row).hexpand(true).build();
         b.add_css_class("term-btn");
-        let (info, source, win, overlay, weak, t) = (
-            info.clone(),
-            source.clone(),
-            window.clone(),
-            overlay.clone(),
-            picker.downgrade(),
-            *t,
-        );
+
+        let (overlay, weak, run) = (overlay.clone(), picker.downgrade(), opt.run.clone());
         b.connect_clicked(move |_| {
             if let Some(p) = weak.upgrade() {
                 overlay.remove_overlay(&p);
             }
-            start_launch(&info, &source, &win, Some(t));
+            run();
         });
-        row.append(&b);
+        picker.append(&b);
         if first.is_none() {
             first = Some(b);
         }
     }
-    picker.append(&row);
 
     let hint = Label::new(Some("Esc to cancel"));
     hint.add_css_class("sugg-empty-sub");
+    hint.set_margin_top(4);
     picker.append(&hint);
 
     overlay.add_overlay(&picker);
     if let Some(b) = first {
         b.grab_focus();
+    }
+}
+
+fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, terms: Vec<&'static str>) {
+    if window.child().and_downcast::<Overlay>().is_none() {
+        start_launch(info, source, window, terms.first().copied());
+        return;
+    }
+    let options = terms
+        .into_iter()
+        .map(|t| {
+            let (info, source, win) = (info.clone(), source.clone(), window.clone());
+            PickOpt {
+                label: t.to_string(),
+                icon: None,
+                run: Rc::new(move || start_launch(&info, &source, &win, Some(t))),
+            }
+        })
+        .collect();
+    show_picker(window, &format!("Open {} with", info.display_name()), options);
+}
+
+fn launch_file(info: &AppInfo, term: Option<&'static str>, path: &Path, window: &ApplicationWindow) {
+    if let Err(e) = run_app(info, term, Some(path)) {
+        eprintln!("Failed to open {} with {}: {}", path.display(), info.display_name(), e);
+    }
+    window.set_visible(false);
+}
+
+fn open_file_with(info: &AppInfo, path: &Path, window: &ApplicationWindow) {
+    if is_terminal_app(info) {
+        let terms = installed_terminals();
+        if terms.len() > 1 {
+            let options = terms
+                .into_iter()
+                .map(|t| {
+                    let (info, path, win) = (info.clone(), path.to_path_buf(), window.clone());
+                    PickOpt {
+                        label: t.to_string(),
+                        icon: None,
+                        run: Rc::new(move || launch_file(&info, Some(t), &path, &win)),
+                    }
+                })
+                .collect();
+            show_picker(window, &format!("Open {} in", info.display_name()), options);
+            return;
+        }
+        launch_file(info, terms.first().copied(), path, window);
+        return;
+    }
+    launch_file(info, None, path, window);
+}
+
+const EDITOR_IDS: [&str; 14] = [
+    "code",
+    "cursor",
+    "co.anysphere.cursor",
+    "windsurf",
+    "zed",
+    "dev.zed.zed",
+    "zeditor",
+    "code-oss",
+    "com.visualstudio.code",
+    "visual-studio-code",
+    "vscodium",
+    "codium",
+    "com.vscodium.codium",
+    "sublime_text",
+];
+
+fn is_ide(a: &AppInfo) -> bool {
+    desktop_keyfile(a)
+        .and_then(|kf| kf.string("Desktop Entry", "Categories").ok())
+        .map_or(false, |c| c.split(';').any(|t| t == "IDE"))
+}
+
+fn find_code_editors() -> Vec<AppInfo> {
+    let all: Vec<AppInfo> = AppInfo::all().into_iter().filter(|a| a.should_show()).collect();
+    let key = |a: &AppInfo| {
+        a.id()
+            .map(|i| i.trim_end_matches(".desktop").to_lowercase())
+            .unwrap_or_default()
+    };
+
+    let mut out: Vec<AppInfo> = Vec::new();
+    for want in EDITOR_IDS {
+        if let Some(a) = all.iter().find(|a| key(a) == want) {
+            if !out.iter().any(|x| x.id() == a.id()) {
+                out.push(a.clone());
+            }
+        }
+    }
+    for a in &all {
+        if !out.iter().any(|x| x.id() == a.id()) && is_ide(a) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+fn open_file_dialog(window: &ApplicationWindow, path: &Path) {
+    let file = gio::File::for_path(path);
+    let ctype = file
+        .query_info("standard::content-type", gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        .ok()
+        .and_then(|i| i.content_type())
+        .map(|c| c.to_string());
+
+    let mut apps: Vec<AppInfo> = Vec::new();
+    let mut default_id = None;
+    if let Some(ct) = &ctype {
+        if let Some(d) = AppInfo::default_for_type(ct, false) {
+            default_id = d.id();
+            apps.push(d);
+        }
+        for a in AppInfo::all_for_type(ct) {
+            if !apps.iter().any(|x| x.id() == a.id()) {
+                apps.push(a);
+            }
+        }
+    }
+
+    if ctype.as_deref() == Some("inode/directory") {
+        let mut editors = find_code_editors();
+        if !editors.is_empty() {
+            apps.retain(|x| !editors.iter().any(|e| e.id() == x.id()));
+            default_id = editors[0].id();
+            editors.append(&mut apps);
+            apps = editors;
+        }
+    }
+    apps.truncate(9);
+
+    match apps.len() {
+        0 => {
+            let _ = AppInfo::launch_default_for_uri(&file.uri(), None::<&gio::AppLaunchContext>);
+            window.set_visible(false);
+        }
+        1 => open_file_with(&apps[0], path, window),
+        _ => {
+            let options = apps
+                .into_iter()
+                .map(|a| {
+                    let mut label = a.display_name().to_string();
+                    if a.id().is_some() && a.id() == default_id {
+                        label.push_str("  (default)");
+                    }
+                    let (icon, path, win) = (a.icon(), path.to_path_buf(), window.clone());
+                    PickOpt {
+                        label,
+                        icon,
+                        run: Rc::new(move || open_file_with(&a, &path, &win)),
+                    }
+                })
+                .collect();
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            show_picker(window, &format!("Open {name} with"), options);
+        }
     }
 }
 
@@ -714,7 +892,7 @@ fn reset_launch(window: &ApplicationWindow) {
 
 fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, term: Option<&'static str>) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
-        let _ = run_app(info, term);
+        let _ = run_app(info, term, None);
         window.set_visible(false);
         return;
     };
@@ -722,7 +900,7 @@ fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
         return;
     }
 
-    if let Err(e) = run_app(info, term) {
+    if let Err(e) = run_app(info, term, None) {
         eprintln!("Failed to launch {}: {}", info.display_name(), e);
         window.set_visible(false);
         return;
@@ -1074,7 +1252,6 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
 
 // ───────────────────── mode panel: Files / Web / Calc / Clipboard / Pills ─────────────────────
 
-/// "relevant" = fuzzy match that is not just a loose scatter of letters
 fn relevant(query: &str, text: &str) -> Option<i32> {
     let qn = query.chars().filter(|c| !c.is_whitespace()).count() as i32;
     let s = fuzzy_score(query, text)?;
@@ -1097,7 +1274,186 @@ fn copy_text(text: &str) {
     }
 }
 
-// ---- calculator (no extra crates): + - * / % ^ ( ) , pi e, sqrt sin cos tan ln log abs exp floor ceil round ----
+#[derive(Clone, Copy)]
+struct Xf {
+    m: f64,
+    e: i64,
+}
+
+impl Xf {
+    const ZERO: Xf = Xf { m: 0.0, e: 0 };
+
+    fn norm(self) -> Option<Xf> {
+        if !self.m.is_finite() {
+            return None;
+        }
+        if self.m == 0.0 {
+            return Some(Xf::ZERO);
+        }
+        let sh = self.m.abs().log10().floor() as i64;
+        let mut m = self.m / 10f64.powi(sh as i32);
+        let mut e = self.e + sh;
+        if m.abs() >= 10.0 {
+            m /= 10.0;
+            e += 1;
+        } else if m.abs() < 1.0 {
+            m *= 10.0;
+            e -= 1;
+        }
+        if !m.is_finite() {
+            return None;
+        }
+        Some(Xf { m, e })
+    }
+
+    fn from_f64(v: f64) -> Option<Xf> {
+        Xf { m: v, e: 0 }.norm()
+    }
+
+    fn to_f64(self) -> Option<f64> {
+        if self.m == 0.0 {
+            return Some(0.0);
+        }
+        if self.e > 308 || self.e < -308 {
+            return None;
+        }
+        let v = self.m * 10f64.powi(self.e as i32);
+        if v.is_finite() {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    fn neg(self) -> Xf {
+        Xf { m: -self.m, e: self.e }
+    }
+
+    fn add(self, b: Xf) -> Option<Xf> {
+        if self.m == 0.0 {
+            return Some(b);
+        }
+        if b.m == 0.0 {
+            return Some(self);
+        }
+        let d = self.e - b.e;
+        if d > 17 {
+            return Some(self);
+        }
+        if d < -17 {
+            return Some(b);
+        }
+        let (hi, lo) = if d >= 0 { (self, b) } else { (b, self) };
+        let k = (hi.e - lo.e) as i32;
+        Xf { m: hi.m + lo.m * 10f64.powi(-k), e: hi.e }.norm()
+    }
+
+    fn sub(self, b: Xf) -> Option<Xf> {
+        self.add(b.neg())
+    }
+
+    fn mul(self, b: Xf) -> Option<Xf> {
+        Xf { m: self.m * b.m, e: self.e + b.e }.norm()
+    }
+
+    fn div(self, b: Xf) -> Option<Xf> {
+        if b.m == 0.0 {
+            return None;
+        }
+        Xf { m: self.m / b.m, e: self.e - b.e }.norm()
+    }
+
+    fn log10abs(self) -> Option<f64> {
+        if self.m == 0.0 {
+            return None;
+        }
+        Some(self.m.abs().log10() + self.e as f64)
+    }
+
+    fn pow10(l: f64) -> Option<Xf> {
+        if !l.is_finite() || l.abs() > 1e15 {
+            return None;
+        }
+        let e = l.floor();
+        Xf { m: 10f64.powf(l - e), e: e as i64 }.norm()
+    }
+
+    fn pow(self, b: Xf) -> Option<Xf> {
+        let bf = b.to_f64()?;
+        if self.m == 0.0 {
+            return if bf > 0.0 { Some(Xf::ZERO) } else { None };
+        }
+        if let Some(af) = self.to_f64() {
+            let r = af.powf(bf);
+            if r.is_finite() && r != 0.0 {
+                return Xf::from_f64(r);
+            }
+        }
+        let neg = self.m < 0.0;
+        if neg && bf.fract() != 0.0 {
+            return None;
+        }
+        let mut r = Xf::pow10(self.log10abs()? * bf)?;
+        if neg && (bf.abs() as u64) % 2 == 1 {
+            r = r.neg();
+        }
+        Some(r)
+    }
+
+    fn sqrt(self) -> Option<Xf> {
+        if self.m < 0.0 {
+            return None;
+        }
+        if self.m == 0.0 {
+            return Some(Xf::ZERO);
+        }
+        if self.e % 2 == 0 {
+            Xf { m: self.m.sqrt(), e: self.e / 2 }.norm()
+        } else {
+            Xf { m: (self.m * 10.0).sqrt(), e: (self.e - 1) / 2 }.norm()
+        }
+    }
+}
+
+fn apply_fn(name: &str, a: Xf) -> Option<Xf> {
+    match name {
+        "sqrt" => a.sqrt(),
+        "abs" => Some(Xf { m: a.m.abs(), e: a.e }),
+        "ln" => {
+            if a.m <= 0.0 {
+                return None;
+            }
+            Xf::from_f64(a.log10abs()? * std::f64::consts::LN_10)
+        }
+        "log" => {
+            if a.m <= 0.0 {
+                return None;
+            }
+            Xf::from_f64(a.log10abs()?)
+        }
+        "exp" => Xf::pow10(a.to_f64()? * std::f64::consts::LOG10_E),
+        "floor" | "ceil" | "round" => {
+            if a.e >= 16 {
+                return Some(a);
+            }
+            let v = a.to_f64()?;
+            Xf::from_f64(match name {
+                "floor" => v.floor(),
+                "ceil" => v.ceil(),
+                _ => v.round(),
+            })
+        }
+        "sin" | "cos" | "tan" => {
+            let v = a.to_f64()?;
+            Xf::from_f64(match name {
+                "sin" => v.sin(),
+                "cos" => v.cos(),
+                _ => v.tan(),
+            })
+        }
+        _ => None,
+    }
+}
 
 struct CalcParser {
     s: Vec<char>,
@@ -1113,19 +1469,21 @@ impl CalcParser {
         self.s.get(self.i).copied()
     }
 
-    fn expr(&mut self) -> Option<f64> {
+    fn expr(&mut self) -> Option<Xf> {
         let mut v = self.term()?;
         while let Some(c) = self.peek() {
             match c {
                 '+' => {
                     self.i += 1;
                     self.ops += 1;
-                    v += self.term()?;
+                    let r = self.term()?;
+                    v = v.add(r)?;
                 }
                 '-' => {
                     self.i += 1;
                     self.ops += 1;
-                    v -= self.term()?;
+                    let r = self.term()?;
+                    v = v.sub(r)?;
                 }
                 _ => break,
             }
@@ -1133,24 +1491,27 @@ impl CalcParser {
         Some(v)
     }
 
-    fn term(&mut self) -> Option<f64> {
+    fn term(&mut self) -> Option<Xf> {
         let mut v = self.unary()?;
         while let Some(c) = self.peek() {
             match c {
                 '*' | '×' => {
                     self.i += 1;
                     self.ops += 1;
-                    v *= self.unary()?;
+                    let r = self.unary()?;
+                    v = v.mul(r)?;
                 }
                 '/' | '÷' => {
                     self.i += 1;
                     self.ops += 1;
-                    v /= self.unary()?;
+                    let r = self.unary()?;
+                    v = v.div(r)?;
                 }
                 '%' => {
                     self.i += 1;
                     self.ops += 1;
-                    v %= self.unary()?;
+                    let r = self.unary()?;
+                    v = Xf::from_f64(v.to_f64()? % r.to_f64()?)?;
                 }
                 _ => break,
             }
@@ -1158,12 +1519,12 @@ impl CalcParser {
         Some(v)
     }
 
-    fn unary(&mut self) -> Option<f64> {
+    fn unary(&mut self) -> Option<Xf> {
         match self.peek()? {
             '-' => {
                 self.i += 1;
                 self.ops += 1;
-                Some(-self.unary()?)
+                Some(self.unary()?.neg())
             }
             '+' => {
                 self.i += 1;
@@ -1173,18 +1534,18 @@ impl CalcParser {
         }
     }
 
-    fn power(&mut self) -> Option<f64> {
+    fn power(&mut self) -> Option<Xf> {
         let base = self.atom()?;
         if self.peek() == Some('^') {
             self.i += 1;
             self.ops += 1;
             let e = self.unary()?;
-            return Some(base.powf(e));
+            return base.pow(e);
         }
         Some(base)
     }
 
-    fn atom(&mut self) -> Option<f64> {
+    fn atom(&mut self) -> Option<Xf> {
         let c = self.peek()?;
         if c == '(' {
             self.i += 1;
@@ -1201,7 +1562,7 @@ impl CalcParser {
                 self.i += 1;
             }
             let t: String = self.s[st..self.i].iter().collect();
-            return t.parse().ok();
+            return Xf::from_f64(t.parse::<f64>().ok()?);
         }
         if c.is_alphabetic() {
             let st = self.i;
@@ -1210,8 +1571,8 @@ impl CalcParser {
             }
             let name: String = self.s[st..self.i].iter().collect::<String>().to_lowercase();
             match name.as_str() {
-                "pi" => return Some(std::f64::consts::PI),
-                "e" => return Some(std::f64::consts::E),
+                "pi" => return Xf::from_f64(std::f64::consts::PI),
+                "e" => return Xf::from_f64(std::f64::consts::E),
                 _ => {}
             }
             if self.peek() != Some('(') {
@@ -1224,20 +1585,7 @@ impl CalcParser {
             }
             self.i += 1;
             self.ops += 1;
-            return match name.as_str() {
-                "sqrt" => Some(a.sqrt()),
-                "sin" => Some(a.sin()),
-                "cos" => Some(a.cos()),
-                "tan" => Some(a.tan()),
-                "ln" => Some(a.ln()),
-                "log" => Some(a.log10()),
-                "abs" => Some(a.abs()),
-                "exp" => Some(a.exp()),
-                "floor" => Some(a.floor()),
-                "ceil" => Some(a.ceil()),
-                "round" => Some(a.round()),
-                _ => None,
-            };
+            return apply_fn(&name, a);
         }
         None
     }
@@ -1252,18 +1600,41 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-/// None unless the query is a real expression (a bare "5" or "pi" is not "relevant")
-fn calc(q: &str) -> Option<String> {
-    let q = q.trim().trim_start_matches('=');
-    let mut p = CalcParser { s: q.chars().collect(), i: 0, ops: 0 };
-    let v = p.expr()?;
-    if p.peek().is_some() || p.ops == 0 || !v.is_finite() {
-        return None;
+fn fmt_x(x: Xf) -> String {
+    if x.m == 0.0 {
+        return "0".to_string();
     }
-    Some(fmt_num(v))
+    if let Some(v) = x.to_f64() {
+        if v.abs() >= 1e-6 && v.abs() < 1e15 {
+            return fmt_num(v);
+        }
+    }
+    let mut m = (x.m * 1e11).round() / 1e11;
+    let mut e = x.e;
+    if m.abs() >= 10.0 {
+        m /= 10.0;
+        e += 1;
+    }
+    let ms = format!("{:.11}", m);
+    let ms = ms.trim_end_matches('0').trim_end_matches('.');
+    format!("{ms}e{e}")
 }
 
-// ---- files: breadth-first walk of $HOME, aborts as soon as a newer query starts ----
+fn calc(q: &str) -> Option<String> {
+    let mut q = q.trim().trim_start_matches('=').trim_start();
+    if let Some(rest) = q.strip_prefix(|c: char| c == 'c' || c == 'C') {
+        let t = rest.trim_start();
+        if matches!(t.chars().next(), Some(ch) if ch.is_ascii_digit() || matches!(ch, '(' | '.' | '-' | '+')) {
+            q = t;
+        }
+    }
+    let mut p = CalcParser { s: q.chars().collect(), i: 0, ops: 0 };
+    let v = p.expr()?;
+    if p.peek().is_some() || p.ops == 0 {
+        return None;
+    }
+    Some(fmt_x(v))
+}
 
 fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
@@ -1309,8 +1680,6 @@ fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
     best.into_iter().map(|(_, p)| p).collect()
 }
 
-// ---- clipboard history (memory only, never written to disk) ----
-
 fn watch_clipboard(display: &Display, hist: Rc<RefCell<VecDeque<String>>>) {
     let cb = display.clipboard();
 
@@ -1338,13 +1707,12 @@ fn watch_clipboard(display: &Display, hist: Rc<RefCell<VecDeque<String>>>) {
     cb.connect_changed(move |_| grab());
 }
 
-// ---- hits ----
-
 #[derive(Clone)]
 struct Hit {
     title: String,
     subtitle: String,
     icon: String,
+    thumb: Option<gtk4::gdk::Texture>,
     action: Rc<dyn Fn()>,
 }
 
@@ -1359,6 +1727,7 @@ enum Cat {
 
 impl Cat {
     const ALL: [Cat; 5] = [Cat::Files, Cat::Web, Cat::Calc, Cat::Clip, Cat::Pills];
+    const HOME: [Cat; 5] = [Cat::Calc, Cat::Files, Cat::Clip, Cat::Pills, Cat::Web];
 
     fn idx(self) -> usize {
         self as usize
@@ -1395,24 +1764,23 @@ fn pretty_dir(p: &std::path::Path) -> String {
     }
 }
 
-fn file_hits(paths: Vec<PathBuf>) -> Vec<Hit> {
+fn file_hits(paths: Vec<PathBuf>, window: &ApplicationWindow) -> Vec<Hit> {
     paths
         .into_iter()
         .map(|p| {
-            let uri = gio::File::for_path(&p).uri().to_string();
+            let win = window.clone();
+            let target = p.clone();
             Hit {
                 title: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
                 subtitle: pretty_dir(&p),
                 icon: if p.is_dir() { "folder" } else { "text-x-generic" }.to_string(),
-                action: Rc::new(move || {
-                    let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
-                }),
+                thumb: None,
+                action: Rc::new(move || open_file_dialog(&win, &target)),
             }
         })
         .collect()
 }
 
-// TODO: real web results need an HTTP client + a search API; for now this is one "search the web" hit
 fn web_hits(q: &str) -> Vec<Hit> {
     let q = q.trim();
     if q.is_empty() {
@@ -1423,10 +1791,140 @@ fn web_hits(q: &str) -> Vec<Hit> {
         title: format!("Search the web for “{q}”"),
         subtitle: "duckduckgo.com".to_string(),
         icon: "applications-internet".to_string(),
+        thumb: None,
         action: Rc::new(move || {
             let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
         }),
     }]
+}
+
+struct WebResult {
+    title: String,
+    url: String,
+    thumb: Option<Vec<u8>>,
+}
+
+fn fetch_thumb(url: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 400_000;
+    let resp = ureq::get(url).timeout(Duration::from_secs(4)).call().ok()?;
+    let mut buf = Vec::new();
+    resp.into_reader().take(MAX + 1).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX).then_some(buf)
+}
+
+const INFO_PROBE_PATH: &str = "/var/lib/cynager/info.probe";
+
+fn read_api_key() -> Option<String> {
+    let src = std::fs::read_to_string(INFO_PROBE_PATH).ok()?;
+    let doc = match infoprober::parse(&src) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("info.probe: {e}");
+            return None;
+        }
+    };
+    let key = doc.get("set", "altDotapi")?.as_str()?.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+fn search_web(q: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
+    let Some(key) = read_api_key() else {
+        return Vec::new();
+    };
+
+    std::thread::sleep(Duration::from_millis(250));
+    if generation.load(Ordering::SeqCst) != mine {
+        return Vec::new();
+    }
+
+    let Ok(resp) = ureq::get("https://api.search.brave.com/res/v1/web/search")
+        .query("q", q)
+        .query("count", &PAGE_MAX.to_string())
+        .set("X-Subscription-Token", &key)
+        .set("Accept", "application/json")
+        .timeout(Duration::from_secs(5))
+        .call()
+    else {
+        return Vec::new();
+    };
+    let Ok(v) = resp.into_json::<serde_json::Value>() else {
+        return Vec::new();
+    };
+
+    let items: Vec<(String, String, Option<String>)> = v["web"]["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .take(PAGE_MAX)
+                .filter_map(|r| {
+                    Some((
+                        r["title"].as_str()?.to_string(),
+                        r["url"].as_str()?.to_string(),
+                        r["thumbnail"]["src"].as_str().map(String::from),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if generation.load(Ordering::SeqCst) != mine {
+        return Vec::new();
+    }
+
+    let thumbs: Vec<Option<Vec<u8>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .iter()
+            .map(|(_, _, t)| s.spawn(move || t.as_deref().and_then(fetch_thumb)))
+            .collect();
+        handles.into_iter().map(|h| h.join().ok().flatten()).collect()
+    });
+
+    items
+        .into_iter()
+        .zip(thumbs)
+        .map(|((title, url, _), thumb)| WebResult { title, url, thumb })
+        .collect()
+}
+
+fn thumb_texture(bytes: Vec<u8>) -> Option<gtk4::gdk::Texture> {
+    use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
+    const TW: i32 = 128;
+    const TH: i32 = 88;
+
+    let stream = gio::MemoryInputStream::from_bytes(&glib::Bytes::from_owned(bytes));
+    let pb = Pixbuf::from_stream(&stream, None::<&gio::Cancellable>).ok()?;
+    let (w, h) = (pb.width().max(1), pb.height().max(1));
+
+    let scale = (TW as f64 / w as f64).max(TH as f64 / h as f64);
+    let sw = ((w as f64 * scale).ceil() as i32).max(TW);
+    let sh = ((h as f64 * scale).ceil() as i32).max(TH);
+    let scaled = pb.scale_simple(sw, sh, InterpType::Bilinear)?;
+    let cropped = scaled.new_subpixbuf((sw - TW) / 2, (sh - TH) / 2, TW, TH);
+    Some(gtk4::gdk::Texture::for_pixbuf(&cropped))
+}
+
+fn web_result_hits(q: &str, found: Vec<WebResult>) -> Vec<Hit> {
+    let mut hits = web_hits(q);
+    hits.extend(found.into_iter().map(|r| {
+        let host = r.url.split('/').nth(2).unwrap_or("").to_string();
+        let thumb = r.thumb.and_then(thumb_texture);
+        let url = r.url;
+        Hit {
+            title: r.title,
+            subtitle: host,
+            icon: "applications-internet".to_string(),
+            thumb,
+            action: Rc::new(move || {
+                let _ = AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
+            }),
+        }
+    }));
+    hits
 }
 
 fn calc_hits(q: &str) -> Vec<Hit> {
@@ -1435,6 +1933,7 @@ fn calc_hits(q: &str) -> Vec<Hit> {
             title: format!("= {res}"),
             subtitle: "Enter to copy the result".to_string(),
             icon: "accessories-calculator".to_string(),
+            thumb: None,
             action: Rc::new(move || copy_text(&res)),
         }],
         None => Vec::new(),
@@ -1456,6 +1955,7 @@ fn clip_hits(q: &str, hist: &VecDeque<String>) -> Vec<Hit> {
                 title: first,
                 subtitle: "Clipboard · Enter to copy again".to_string(),
                 icon: "edit-paste".to_string(),
+                thumb: None,
                 action: Rc::new(move || copy_text(&text)),
             }
         })
@@ -1474,6 +1974,7 @@ fn pill_hits(q: &str) -> Vec<Hit> {
                     title: name.to_string(),
                     subtitle: cmd.clone(),
                     icon: icon.to_string(),
+                    thumb: None,
                     action: Rc::new(move || {
                         let mut c = Command::new("sh");
                         c.arg("-c").arg(&cmd);
@@ -1488,8 +1989,21 @@ fn pill_hits(q: &str) -> Vec<Hit> {
 }
 
 fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
-    let icon = Image::from_icon_name(&hit.icon);
-    icon.set_pixel_size(28);
+    let lead: gtk4::Widget = match &hit.thumb {
+        Some(tex) => {
+            let pic = Picture::for_paintable(tex);
+            pic.set_can_shrink(true);
+            pic.set_size_request(64, 44);
+            pic.set_valign(gtk4::Align::Center);
+            pic.add_css_class("hit-thumb");
+            pic.upcast()
+        }
+        None => {
+            let icon = Image::from_icon_name(&hit.icon);
+            icon.set_pixel_size(28);
+            icon.upcast()
+        }
+    };
 
     let title = Label::new(Some(&hit.title));
     title.add_css_class("hit-title");
@@ -1512,7 +2026,7 @@ fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
     text.append(&sub);
 
     let row = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).build();
-    row.append(&icon);
+    row.append(&lead);
     row.append(&text);
 
     let button = Button::builder().child(&row).hexpand(true).build();
@@ -1523,9 +2037,140 @@ fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
     let win = window.clone();
     button.connect_clicked(move |_| {
         action();
-        win.set_visible(false);
+        if picker_widget(&win).is_none() {
+            win.set_visible(false);
+        }
     });
     button
+}
+
+fn help_chip(text: &str) -> Label {
+    let l = Label::new(Some(text));
+    l.add_css_class("help-chip");
+    l
+}
+
+fn help_chips(items: &[&str]) -> FlowBox {
+    let fb = FlowBox::builder()
+        .selection_mode(SelectionMode::None)
+        .homogeneous(false)
+        .min_children_per_line(1)
+        .max_children_per_line(40)
+        .row_spacing(6)
+        .column_spacing(6)
+        .hexpand(true)
+        .valign(gtk4::Align::Center)
+        .css_classes(["help-chips"])
+        .build();
+    for i in items {
+        fb.insert(&help_chip(i), -1);
+    }
+    fb
+}
+
+fn help_text(t: &str) -> Label {
+    let l = Label::new(Some(t));
+    l.add_css_class("help-sub");
+    l.set_xalign(0.0);
+    l.set_wrap(true);
+    l.set_hexpand(true);
+    l
+}
+
+fn help_row(glyph: &str, tile_class: &str, label: &str, content: &impl IsA<gtk4::Widget>) -> GtkBox {
+    let tile = Label::new(Some(glyph));
+    tile.add_css_class("help-tile");
+    tile.add_css_class(tile_class);
+    tile.set_valign(gtk4::Align::Center);
+
+    let name = Label::new(Some(label));
+    name.add_css_class("help-label");
+    name.set_xalign(0.0);
+    name.set_width_chars(13);
+
+    let row = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    row.append(&tile);
+    row.append(&name);
+    row.append(content);
+    row
+}
+
+fn calc_help() -> GtkBox {
+    let root = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(4)
+        .build();
+
+    let hero = Label::new(Some("="));
+    hero.add_css_class("help-hero");
+    let title = Label::new(Some("Calculator"));
+    title.add_css_class("help-title");
+    title.set_xalign(0.0);
+    let sub = Label::new(Some("Type c or = and then your sum"));
+    sub.add_css_class("help-sub");
+    sub.set_xalign(0.0);
+    let titles = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk4::Align::Center)
+        .build();
+    titles.append(&title);
+    titles.append(&sub);
+    let header = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(2)
+        .build();
+    header.append(&hero);
+    header.append(&titles);
+    root.append(&header);
+
+    let example = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .valign(gtk4::Align::Center)
+        .build();
+    example.append(&help_chip("c23+53*(2334^872)"));
+    example.append(&help_text("→  5.1076e2938"));
+
+    let rows: Vec<GtkBox> = vec![
+        help_row("≈", "tile-teal", "Example", &example),
+        help_row("c", "tile-blue", "Start with", &help_chips(&["c", "="])),
+        help_row("±", "tile-orange", "Operators", &help_chips(&["+", "-", "*", "/", "%", "^", "( )"])),
+        help_row("π", "tile-purple", "Constants", &help_chips(&["pi", "e"])),
+        help_row(
+            "ƒ",
+            "tile-green",
+            "Functions",
+            &help_chips(&["sqrt", "sin", "cos", "tan", "ln", "log", "exp", "abs", "floor", "ceil", "round"]),
+        ),
+        help_row("∞", "tile-gray", "Big numbers", &help_text("Huge powers work, shown like 5.1e2938")),
+        help_row("↵", "tile-red", "Enter", &help_text("Copies the result")),
+    ];
+
+    let group = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .css_classes(["help-group"])
+        .build();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            let div = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            div.add_css_class("help-div");
+            group.append(&div);
+        }
+        group.append(row);
+    }
+    root.append(&group);
+    root
 }
 
 fn clear_box(b: &GtkBox) {
@@ -1604,7 +2249,7 @@ impl ModePanel {
             .build();
 
         let mut tabs: Vec<(&'static str, Button)> = Vec::new();
-        let labels = std::iter::once(("home", "Home")).chain(Cat::ALL.iter().map(|c| (c.id(), c.title())));
+        let labels = std::iter::once(("home", "Top Results")).chain(Cat::ALL.iter().map(|c| (c.id(), c.title())));
         for (id, label) in labels {
             let b = Button::with_label(label);
             b.add_css_class("flat");
@@ -1660,12 +2305,11 @@ impl ModePanel {
         self.focused.get()
     }
 
-    /// hits shown on the visible page, in the same order as their rows
     fn visible_hits(&self) -> Vec<Hit> {
         let name = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
         let res = self.results.borrow();
         if name.is_empty() || name == "home" {
-            Cat::ALL.iter().filter_map(|c| res[c.idx()].first().cloned()).collect()
+            Cat::HOME.iter().filter_map(|c| res[c.idx()].first().cloned()).collect()
         } else {
             Cat::ALL
                 .iter()
@@ -1734,14 +2378,12 @@ impl ModePanel {
         }
     }
 
-    /// back to the app results (left / right, or up from the first mode result)
     fn focus_apps(&self) {
         self.focused.set(false);
         self.sel.set(None);
         self.apply_selection();
     }
 
-    /// down: apps -> first mode result -> next ...; up: previous, and from the first one back to apps
     fn move_hit(&self, delta: i32) {
         let n = self.visible_rows().len();
         if n == 0 {
@@ -1817,7 +2459,27 @@ impl ModePanel {
             glib::spawn_future_local(async move {
                 if let Ok(paths) = rx.recv().await {
                     if panel.generation.load(Ordering::SeqCst) == mine {
-                        panel.results.borrow_mut()[Cat::Files.idx()] = file_hits(paths);
+                        panel.results.borrow_mut()[Cat::Files.idx()] = file_hits(paths, &panel.window);
+                        panel.render();
+                    }
+                }
+            });
+        }
+
+        if !q.is_empty() {
+            let (tx, rx) = async_channel::bounded::<Vec<WebResult>>(1);
+            let generation = self.generation.clone();
+            let qq = q.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(search_web(&qq, &generation, mine));
+            });
+
+            let panel = self.clone();
+            let qq = q.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(found) = rx.recv().await {
+                    if panel.generation.load(Ordering::SeqCst) == mine && !found.is_empty() {
+                        panel.results.borrow_mut()[Cat::Web.idx()] = web_result_hits(&qq, found);
                         panel.render();
                     }
                 }
@@ -1834,30 +2496,34 @@ impl ModePanel {
             let page = &self.pages[c.idx()];
             clear_box(page);
 
-            // home: top hit of each category, nothing at all for empty ones
-            if let Some(top) = hits.first() {
-                let head = Label::new(Some(c.title()));
-                head.add_css_class("hit-cat");
-                head.set_halign(gtk4::Align::Start);
-                self.home.append(&head);
-                self.home.append(&hit_button(top, &self.window));
-            }
-
             if hits.is_empty() {
-                let none = Label::new(Some("Nothing found"));
-                none.add_css_class("sugg-empty-sub");
-                none.set_halign(gtk4::Align::Start);
-                page.append(&none);
+                if c == Cat::Calc {
+                    page.append(&calc_help());
+                } else {
+                    let none = Label::new(Some("Nothing found"));
+                    none.add_css_class("sugg-empty-sub");
+                    none.set_halign(gtk4::Align::Start);
+                    page.append(&none);
+                }
             } else {
                 for h in hits.iter().take(PAGE_MAX) {
                     page.append(&hit_button(h, &self.window));
                 }
             }
         }
+
+        for c in Cat::HOME {
+            if let Some(top) = res[c.idx()].first() {
+                let head = Label::new(Some(c.title()));
+                head.add_css_class("hit-cat");
+                head.set_halign(gtk4::Align::Start);
+                self.home.append(&head);
+                self.home.append(&hit_button(top, &self.window));
+            }
+        }
         self.apply_selection();
     }
 
-    /// runs the selected hit of the visible page (first one if none is selected)
     fn activate_current(&self) -> bool {
         let hits = self.visible_hits();
         let idx = self.sel.get().unwrap_or(0);
@@ -1865,7 +2531,9 @@ impl ModePanel {
             Some(h) => {
                 let a = h.action.clone();
                 a();
-                self.window.set_visible(false);
+                if picker_widget(&self.window).is_none() {
+                    self.window.set_visible(false);
+                }
                 true
             }
             None => false,
@@ -1947,7 +2615,6 @@ fn build_window(
         .application(app)
         .title("alt.")
         .default_width(800)
-        // .default_height(560)
         .resizable(false)
         .decorated(false)
         .css_classes(["win"])
@@ -2141,7 +2808,6 @@ fn build_window(
             }
             if ui.active() {
                 match key {
-                    // up / down walk the mode-panel results
                     gtk4::gdk::Key::Down => {
                         ui.panel.move_hit(1);
                         return glib::Propagation::Stop;
@@ -2150,7 +2816,6 @@ fn build_window(
                         ui.panel.move_hit(-1);
                         return glib::Propagation::Stop;
                     }
-                    // left / right: back to the app results, then move through them
                     gtk4::gdk::Key::Left | gtk4::gdk::Key::Right => {
                         if ui.panel.mode_focused() {
                             ui.panel.focus_apps();
@@ -2183,7 +2848,6 @@ fn build_window(
                                 return glib::Propagation::Stop;
                             }
                         }
-                        // not a shortcut: fall through and start a search with the digit
                     }
 
                     if !ui.active() {
@@ -2433,6 +3097,68 @@ fn build_window(
             background-color: transparent;
         }
 
+        .help-hero {
+            min-width: 44px;
+            min-height: 44px;
+            border-radius: 12px;
+            background: linear-gradient(#fff2, #0001),  #ff7c7c;
+            color: white;
+            font-size: 26px;
+            font-weight: 700;
+        }
+        .help-title {
+            font-size: 17px;
+            font-weight: 700;
+            color: rgba(253, 253, 253, 0.9);
+        }
+        .help-sub {
+            font-size: 12px;
+            color: rgba(253, 253, 253, 0.5);
+        }
+        .help-group {
+            background-color: rgba(255, 255, 255, 0.06);
+            border-radius: 14px;
+        }
+        .help-div {
+            min-height: 1px;
+            margin-left: 50px;
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        .help-label {
+            font-size: 13px;
+            font-weight: 600;
+            color: rgba(253, 253, 253, 0.8);
+        }
+        .help-tile {
+            min-width: 26px;
+            min-height: 26px;
+            border-radius: 50px;
+            font-size: 14px;
+            font-weight: 700;
+            color: white;
+        }
+        .tile-blue { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #0a84ff; }
+        .tile-orange { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #ff9f0a; }
+        .tile-purple { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #bf5af2; }
+        .tile-green { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #30d158; }
+        .tile-gray { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #8e8e93; }
+        .tile-red { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #ff453a; }
+        .tile-teal { background: linear-gradient(#fff2, rgba(0, 0, 0, 0.28)),  #40c8e0; }
+        .help-chip {
+            padding: 2px 9px;
+            border-radius: 20px;
+            background-color: rgba(255, 255, 255, 0.1);
+            font-family: monospace;
+            font-size: 12px;
+            color: rgba(253, 253, 253, 0.85);
+        }
+        .help-chips flowboxchild {
+            padding: 0;
+            margin: 0;
+            min-width: 0;
+            min-height: 0;
+        }
+
         .term-pick {
             padding: 22px 26px;
             border-radius: 24px;
@@ -2455,6 +3181,10 @@ fn build_window(
         }
         .term-btn:hover, .term-btn:focus {
             background-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .hit-thumb {
+            border-radius: 8px;
         }
 
         .pagetitle {
