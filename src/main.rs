@@ -33,8 +33,12 @@ const PAGE_MAX: usize = 8;
 const FILE_DEPTH: usize = 5;
 const FILE_SCAN_LIMIT: usize = 40_000;
 const FILE_MIN_QUERY: usize = 2;
-const CLIP_KEEP: usize = 50;
-const CLIP_MAX_BYTES: usize = 10_000;
+const CLIP_PREVIEW_WIDTH: &str = "400";
+const CLIP_THUMB_CACHE: usize = 256;
+const CLIP_ALL_MAX: usize = 200;
+const CLIP_IMG_MAX_BYTES: usize = 25_000_000;
+const CUSTOM_ICON_DIR: &str = "/var/lib/cynager/icons";
+const HIT_ICON_SIZE: i32 = 46;
 const FILE_SKIP_DIRS: [&str; 5] = ["node_modules", "target", "venv", "__pycache__", "site-packages"];
 
 const TERMINALS: [(&str, &[&str]); 2] = [("kitty", &[]), ("xterm", &["-e"])];
@@ -1680,31 +1684,13 @@ fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
     best.into_iter().map(|(_, p)| p).collect()
 }
 
-fn watch_clipboard(display: &Display, hist: Rc<RefCell<VecDeque<String>>>) {
-    let cb = display.clipboard();
-
-    let grab = {
-        let cb = cb.clone();
-        move || {
-            let cb = cb.clone();
-            let hist = hist.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(Some(t)) = cb.read_text_future().await {
-                    let t = t.to_string();
-                    if t.trim().is_empty() || t.len() > CLIP_MAX_BYTES {
-                        return;
-                    }
-                    let mut h = hist.borrow_mut();
-                    h.retain(|x| x != &t);
-                    h.push_front(t);
-                    h.truncate(CLIP_KEEP);
-                }
-            });
-        }
-    };
-
-    grab();
-    cb.connect_changed(move |_| grab());
+fn custom_icon(file: &str, fallback: &str) -> String {
+    let p = Path::new(CUSTOM_ICON_DIR).join(file);
+    if p.is_file() {
+        p.to_string_lossy().to_string()
+    } else {
+        fallback.to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -1713,6 +1699,7 @@ struct Hit {
     subtitle: String,
     icon: String,
     thumb: Option<gtk4::gdk::Texture>,
+    clip_line: Option<String>,
     action: Rc<dyn Fn()>,
 }
 
@@ -1775,6 +1762,7 @@ fn file_hits(paths: Vec<PathBuf>, window: &ApplicationWindow) -> Vec<Hit> {
                 subtitle: pretty_dir(&p),
                 icon: if p.is_dir() { "folder" } else { "text-x-generic" }.to_string(),
                 thumb: None,
+                clip_line: None,
                 action: Rc::new(move || open_file_dialog(&win, &target)),
             }
         })
@@ -1790,8 +1778,9 @@ fn web_hits(q: &str) -> Vec<Hit> {
     vec![Hit {
         title: format!("Search the web for “{q}”"),
         subtitle: "duckduckgo.com".to_string(),
-        icon: "applications-internet".to_string(),
+        icon: custom_icon("web.svg", "applications-internet"),
         thumb: None,
+        clip_line: None,
         action: Rc::new(move || {
             let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
         }),
@@ -1891,7 +1880,7 @@ fn search_web(q: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
         .collect()
 }
 
-fn thumb_texture(bytes: Vec<u8>) -> Option<gtk4::gdk::Texture> {
+fn thumb_pixbuf(bytes: Vec<u8>) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
     use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
     const TW: i32 = 128;
     const TH: i32 = 88;
@@ -1904,8 +1893,50 @@ fn thumb_texture(bytes: Vec<u8>) -> Option<gtk4::gdk::Texture> {
     let sw = ((w as f64 * scale).ceil() as i32).max(TW);
     let sh = ((h as f64 * scale).ceil() as i32).max(TH);
     let scaled = pb.scale_simple(sw, sh, InterpType::Bilinear)?;
-    let cropped = scaled.new_subpixbuf((sw - TW) / 2, (sh - TH) / 2, TW, TH);
-    Some(gtk4::gdk::Texture::for_pixbuf(&cropped))
+    Some(scaled.new_subpixbuf((sw - TW) / 2, (sh - TH) / 2, TW, TH))
+}
+
+fn thumb_texture(bytes: Vec<u8>) -> Option<gtk4::gdk::Texture> {
+    let pb = thumb_pixbuf(bytes)?;
+    Some(gtk4::gdk::Texture::for_pixbuf(&pb))
+}
+
+#[derive(Clone)]
+struct ThumbPixels {
+    data: Vec<u8>,
+    w: i32,
+    h: i32,
+    stride: usize,
+    alpha: bool,
+}
+
+impl ThumbPixels {
+    fn texture(&self) -> gtk4::gdk::Texture {
+        let fmt = if self.alpha {
+            gtk4::gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gtk4::gdk::MemoryFormat::R8g8b8
+        };
+        gtk4::gdk::MemoryTexture::new(
+            self.w,
+            self.h,
+            fmt,
+            &glib::Bytes::from(&self.data[..]),
+            self.stride,
+        )
+        .upcast::<gtk4::gdk::Texture>()
+    }
+}
+
+fn thumb_pixels(bytes: Vec<u8>) -> Option<ThumbPixels> {
+    let flat = thumb_pixbuf(bytes)?.copy()?;
+    Some(ThumbPixels {
+        w: flat.width(),
+        h: flat.height(),
+        stride: flat.rowstride() as usize,
+        alpha: flat.has_alpha(),
+        data: flat.read_pixel_bytes().to_vec(),
+    })
 }
 
 fn web_result_hits(q: &str, found: Vec<WebResult>) -> Vec<Hit> {
@@ -1917,8 +1948,9 @@ fn web_result_hits(q: &str, found: Vec<WebResult>) -> Vec<Hit> {
         Hit {
             title: r.title,
             subtitle: host,
-            icon: "applications-internet".to_string(),
+            icon: custom_icon("web.svg", "applications-internet"),
             thumb,
+            clip_line: None,
             action: Rc::new(move || {
                 let _ = AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>);
             }),
@@ -1932,34 +1964,391 @@ fn calc_hits(q: &str) -> Vec<Hit> {
         Some(res) => vec![Hit {
             title: format!("= {res}"),
             subtitle: "Enter to copy the result".to_string(),
-            icon: "accessories-calculator".to_string(),
+            icon: custom_icon("calc.svg", "accessories-calculator"),
             thumb: None,
+            clip_line: None,
             action: Rc::new(move || copy_text(&res)),
         }],
         None => Vec::new(),
     }
 }
 
-fn clip_hits(q: &str, hist: &VecDeque<String>) -> Vec<Hit> {
-    let ql = q.trim().to_lowercase();
-    if ql.is_empty() {
-        return Vec::new();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipKind {
+    Text,
+    Image,
+    Files,
+    Clear,
+}
+
+struct ClipItem {
+    line: String,
+    kind: ClipKind,
+    title: String,
+    subtitle: String,
+    thumb: Option<ThumbPixels>,
+}
+
+static CLIP_THUMBS: std::sync::OnceLock<Mutex<HashMap<u64, ThumbPixels>>> = std::sync::OnceLock::new();
+
+fn ensure_cliphist_watchers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if !(in_path("cliphist") && in_path("wl-paste")) {
+            return;
+        }
+        let running = Command::new("pgrep")
+            .args(["-f", "wl-paste.*cliphist store"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if running {
+            return;
+        }
+        let mut c = Command::new("wl-paste");
+        c.args(["--watch", "cliphist", "store"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = spawn_detached(&mut c);
+    });
+}
+
+fn cliphist_list() -> std::io::Result<Vec<(u64, String, String)>> {
+    let out = Command::new("cliphist")
+        .args(["-preview-width", CLIP_PREVIEW_WIDTH, "list"])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
     }
-    hist.iter()
-        .filter(|t| t.to_lowercase().contains(&ql))
-        .take(PAGE_MAX)
-        .map(|t| {
-            let first = t.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
-            let text = t.clone();
-            Hit {
-                title: first,
-                subtitle: "Clipboard · Enter to copy again".to_string(),
-                icon: "edit-paste".to_string(),
-                thumb: None,
-                action: Rc::new(move || copy_text(&text)),
-            }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .filter_map(|l| {
+            let (id, prev) = l.split_once('\t')?;
+            Some((id.trim().parse().ok()?, prev.to_string(), l.to_string()))
         })
+        .collect())
+}
+
+fn cliphist_decode(line: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("cliphist")
+        .arg("decode")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(line.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_binary_preview(p: &str) -> Option<String> {
+    let inner = p.trim().strip_prefix("[[")?.strip_suffix("]]")?.trim();
+    Some(inner.strip_prefix("binary data")?.trim().to_string())
+}
+
+fn looks_like_files(p: &str) -> bool {
+    let t = p.trim_start();
+    t.starts_with("file://") || t.starts_with("x-special/gnome-copied-files")
+}
+
+fn parse_file_uris(text: &str) -> Vec<PathBuf> {
+    text.split_whitespace()
+        .filter_map(|t| t.strip_prefix("file://"))
+        .map(|p| PathBuf::from(percent_decode(p)))
         .collect()
+}
+
+fn is_image_path(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tif" | "tiff")
+    )
+}
+
+fn clip_thumb(id: u64, line: &str) -> Option<ThumbPixels> {
+    let cache = CLIP_THUMBS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some(t) = c.get(&id) {
+            return Some(t.clone());
+        }
+    }
+    let bytes = cliphist_decode(line)?;
+    if bytes.len() > CLIP_IMG_MAX_BYTES {
+        return None;
+    }
+    let t = thumb_pixels(bytes)?;
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= CLIP_THUMB_CACHE {
+            c.clear();
+        }
+        c.insert(id, t.clone());
+    }
+    Some(t)
+}
+
+fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
+    if let Some(info) = parse_binary_preview(prev) {
+        let parts: Vec<&str> = info.split_whitespace().collect();
+        let (title, subtitle) = if parts.len() >= 4 {
+            (
+                format!("Image · {} {}", parts[2], parts[3]),
+                format!("{} {} · Enter to select · Del to delete", parts[0], parts[1]),
+            )
+        } else {
+            ("Image".to_string(), format!("{info} · Enter to select · Del to delete"))
+        };
+        let thumb = clip_thumb(id, &line);
+        return ClipItem { line, kind: ClipKind::Image, title, subtitle, thumb };
+    }
+
+    if looks_like_files(prev) {
+        let full = cliphist_decode(&line)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|| prev.to_string());
+        let paths = parse_file_uris(&full);
+        if let Some(first) = paths.first() {
+            let name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let (title, subtitle) = if paths.len() == 1 {
+                (name, format!("{} · Enter to select · Del to delete", pretty_dir(first)))
+            } else {
+                (
+                    format!("{name} +{} more", paths.len() - 1),
+                    format!("{} files · {}", paths.len(), pretty_dir(first)),
+                )
+            };
+            let thumb = (paths.len() == 1 && is_image_path(first))
+                .then(|| {
+                    let meta = std::fs::metadata(first).ok()?;
+                    if meta.len() as usize > CLIP_IMG_MAX_BYTES {
+                        return None;
+                    }
+                    thumb_pixels(std::fs::read(first).ok()?)
+                })
+                .flatten();
+            return ClipItem { line, kind: ClipKind::Files, title, subtitle, thumb };
+        }
+    }
+
+    ClipItem {
+        line,
+        kind: ClipKind::Text,
+        title: prev.trim().to_string(),
+        subtitle: "Clipboard · Enter to select · Del to delete".to_string(),
+        thumb: None,
+    }
+}
+
+fn clear_clip() {
+    std::thread::spawn(|| {
+        let _ = Command::new("cliphist")
+            .arg("wipe")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Some(cache) = CLIP_THUMBS.get() {
+            if let Ok(mut c) = cache.lock() {
+                c.clear();
+            }
+        }
+    });
+}
+
+fn is_clip_query(q: &str) -> bool {
+    matches!(
+        q.split_whitespace().next().map(|w| w.to_lowercase()).as_deref(),
+        Some("clip" | "clipboard")
+    )
+}
+
+fn page_limit(c: Cat) -> usize {
+    if c == Cat::Clip { CLIP_ALL_MAX } else { PAGE_MAX }
+}
+
+fn cliphist_delete(line: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let Ok(mut child) = Command::new("cliphist")
+        .arg("delete")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(line.as_bytes());
+    }
+    let _ = child.wait();
+}
+
+fn search_clip(q: &str, generation: &AtomicU64, mine: u64) -> Result<Vec<ClipItem>, String> {
+    let list_all = is_clip_query(q);
+    let mut words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
+    if list_all {
+        words.remove(0);
+    }
+    if words.is_empty() && !list_all {
+        return Ok(Vec::new());
+    }
+    let limit = if list_all { CLIP_ALL_MAX } else { PAGE_MAX };
+
+    let entries = match cliphist_list() {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| eprintln!("cliphist not found; clipboard history disabled"));
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+
+    if list_all && words.len() == 1 && matches!(words[0].as_str(), "clear" | "wipe") {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![ClipItem {
+            line: String::new(),
+            kind: ClipKind::Clear,
+            title: "Clear clipboard history".to_string(),
+            subtitle: format!("Enter to delete all {} entries", entries.len()),
+            thumb: None,
+        }]);
+    }
+
+    let mut items = Vec::new();
+    for (id, prev, line) in entries {
+        if items.len() >= limit {
+            break;
+        }
+        if generation.load(Ordering::SeqCst) != mine {
+            return Ok(Vec::new());
+        }
+
+        let hay = if parse_binary_preview(&prev).is_some() {
+            format!("image img picture screenshot {prev}")
+        } else if looks_like_files(&prev) {
+            format!("file files {}", percent_decode(&prev))
+        } else {
+            prev.clone()
+        }
+        .to_lowercase();
+
+        if words.iter().all(|w| hay.contains(w.as_str())) {
+            items.push(build_clip_item(id, &prev, line));
+        }
+    }
+    Ok(items)
+}
+
+fn clip_mime(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if b.len() > 14 && b.starts_with(b"BM") && b[6..10] == [0, 0, 0, 0] {
+        Some("image/bmp")
+    } else if b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if b.starts_with(b"x-special/gnome-copied-files") {
+        Some("x-special/gnome-copied-files")
+    } else if b.starts_with(b"file://") {
+        Some("text/uri-list")
+    } else {
+        None
+    }
+}
+
+fn restore_clip(line: &str) {
+    let line = line.to_string();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        use std::process::Stdio;
+        let Some(bytes) = cliphist_decode(&line) else { return };
+        let mut cmd = Command::new("wl-copy");
+        if let Some(m) = clip_mime(&bytes) {
+            cmd.arg("--type").arg(m);
+        }
+        let Ok(mut child) = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(&bytes);
+        }
+        let _ = child.wait();
+    });
+}
+
+fn clip_hits(res: Result<Vec<ClipItem>, String>) -> Vec<Hit> {
+    match res {
+        Err(msg) => vec![Hit {
+            title: "Clipboard history unavailable".to_string(),
+            subtitle: msg,
+            icon: "dialog-warning".to_string(),
+            thumb: None,
+            clip_line: None,
+            action: Rc::new(|| {}),
+        }],
+        Ok(items) => items
+            .into_iter()
+            .map(|it| {
+                let clear = it.kind == ClipKind::Clear;
+                let line = it.line;
+                let action: Rc<dyn Fn()> = if clear {
+                    Rc::new(clear_clip)
+                } else {
+                    let l = line.clone();
+                    Rc::new(move || restore_clip(&l))
+                };
+                Hit {
+                    title: it.title,
+                    subtitle: it.subtitle,
+                    icon: match it.kind {
+                        ClipKind::Text => custom_icon("clip.svg", "edit-paste"),
+                        ClipKind::Image => "image-x-generic".to_string(),
+                        ClipKind::Files => "text-x-generic".to_string(),
+                        ClipKind::Clear => "edit-delete".to_string(),
+                    },
+                    thumb: it.thumb.map(|t| t.texture()),
+                    clip_line: if clear { None } else { Some(line) },
+                    action,
+                }
+            })
+            .collect(),
+    }
 }
 
 fn pill_hits(q: &str) -> Vec<Hit> {
@@ -1975,6 +2364,7 @@ fn pill_hits(q: &str) -> Vec<Hit> {
                     subtitle: cmd.clone(),
                     icon: icon.to_string(),
                     thumb: None,
+                    clip_line: None,
                     action: Rc::new(move || {
                         let mut c = Command::new("sh");
                         c.arg("-c").arg(&cmd);
@@ -1999,8 +2389,13 @@ fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
             pic.upcast()
         }
         None => {
-            let icon = Image::from_icon_name(&hit.icon);
-            icon.set_pixel_size(28);
+            let icon = if hit.icon.starts_with('/') {
+                let file = gio::File::for_path(&hit.icon);
+                Image::from_gicon(&gio::FileIcon::new(&file))
+            } else {
+                Image::from_icon_name(&hit.icon)
+            };
+            icon.set_pixel_size(HIT_ICON_SIZE);
             icon.upcast()
         }
     };
@@ -2173,6 +2568,83 @@ fn calc_help() -> GtkBox {
     root
 }
 
+fn help_panel(glyph: &str, title: &str, sub: &str, rows: Vec<GtkBox>) -> GtkBox {
+    let root = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(4)
+        .build();
+
+    let hero = Label::new(Some(glyph));
+    hero.add_css_class("help-hero");
+    let title = Label::new(Some(title));
+    title.add_css_class("help-title");
+    title.set_xalign(0.0);
+    let sub = Label::new(Some(sub));
+    sub.add_css_class("help-sub");
+    sub.set_xalign(0.0);
+    let titles = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk4::Align::Center)
+        .build();
+    titles.append(&title);
+    titles.append(&sub);
+    let header = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(2)
+        .build();
+    header.append(&hero);
+    header.append(&titles);
+    root.append(&header);
+
+    let group = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .css_classes(["help-group"])
+        .build();
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            let div = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+            div.add_css_class("help-div");
+            group.append(&div);
+        }
+        group.append(row);
+    }
+    root.append(&group);
+    root
+}
+
+fn clip_help() -> GtkBox {
+    let clear = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .valign(gtk4::Align::Center)
+        .build();
+    clear.append(&help_chip("clip clear"));
+    clear.append(&help_text("then Enter wipes the whole history"));
+
+    help_panel(
+        "⧉",
+        "Clipboard",
+        "Type clip to browse everything you copied",
+        vec![
+            help_row("⧉", "tile-blue", "Browse", &help_chips(&["clip", "clipboard"])),
+            help_row(
+                "⌕",
+                "tile-teal",
+                "Search",
+                &help_chips(&["search", "clip png",]),
+            ),
+            help_row("⌫", "tile-orange", "Delete", &help_text("Select an entry with ↑ ↓, then press Del")),
+            help_row("✕", "tile-red", "Clear all", &clear),
+            help_row("↵", "tile-green", "Enter", &help_text("Selects in clipboard: text, images and files")),
+            help_row("i", "tile-gray", "Dependencies", &help_chips(&["cliphist", "wl-clipboard"])),
+        ],
+    )
+}
+
 fn clear_box(b: &GtkBox) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
@@ -2198,7 +2670,6 @@ struct ModePanel {
     home: GtkBox,
     pages: Vec<GtkBox>,
     results: Rc<RefCell<Vec<Vec<Hit>>>>,
-    clip: Rc<RefCell<VecDeque<String>>>,
     generation: Arc<AtomicU64>,
     apps_box: GtkBox,
     hits_scroller: ScrolledWindow,
@@ -2207,9 +2678,8 @@ struct ModePanel {
 }
 
 impl ModePanel {
-    fn new(window: &ApplicationWindow, host: &GtkBox, display: &Display, apps_box: &GtkBox) -> Self {
-        let clip = Rc::new(RefCell::new(VecDeque::new()));
-        watch_clipboard(display, clip.clone());
+    fn new(window: &ApplicationWindow, host: &GtkBox, _display: &Display, apps_box: &GtkBox) -> Self {
+        ensure_cliphist_watchers();
 
         let stack = Stack::builder()
             .transition_type(StackTransitionType::Crossfade)
@@ -2278,7 +2748,6 @@ impl ModePanel {
             home,
             pages,
             results: Rc::new(RefCell::new(vec![Vec::new(); Cat::ALL.len()])),
-            clip,
             generation: Arc::new(AtomicU64::new(0)),
             apps_box: apps_box.clone(),
             hits_scroller: scroller,
@@ -2314,7 +2783,7 @@ impl ModePanel {
             Cat::ALL
                 .iter()
                 .find(|c| c.id() == name)
-                .map(|c| res[c.idx()].iter().take(PAGE_MAX).cloned().collect())
+                .map(|c| res[c.idx()].iter().take(page_limit(*c)).cloned().collect())
                 .unwrap_or_default()
         }
     }
@@ -2436,12 +2905,18 @@ impl ModePanel {
         self.focused.set(false);
         self.sel.set(None);
 
+        if is_clip_query(&q)
+            && self.stack.visible_child_name().map(|n| n.as_str() != "clip").unwrap_or(true)
+        {
+            self.select("clip");
+        }
+
         {
             let mut r = self.results.borrow_mut();
             r[Cat::Files.idx()].clear();
             r[Cat::Web.idx()] = web_hits(&q);
             r[Cat::Calc.idx()] = calc_hits(&q);
-            r[Cat::Clip.idx()] = clip_hits(&q, &self.clip.borrow());
+            r[Cat::Clip.idx()].clear();
             r[Cat::Pills.idx()] = pill_hits(&q);
         }
         self.render();
@@ -2461,6 +2936,28 @@ impl ModePanel {
                     if panel.generation.load(Ordering::SeqCst) == mine {
                         panel.results.borrow_mut()[Cat::Files.idx()] = file_hits(paths, &panel.window);
                         panel.render();
+                    }
+                }
+            });
+        }
+
+        if !q.is_empty() {
+            let (tx, rx) = async_channel::bounded::<Result<Vec<ClipItem>, String>>(1);
+            let generation = self.generation.clone();
+            let qq = q.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(search_clip(&qq, &generation, mine));
+            });
+
+            let panel = self.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(res) = rx.recv().await {
+                    if panel.generation.load(Ordering::SeqCst) == mine {
+                        let hits = clip_hits(res);
+                        if !hits.is_empty() {
+                            panel.results.borrow_mut()[Cat::Clip.idx()] = hits;
+                            panel.render();
+                        }
                     }
                 }
             });
@@ -2499,6 +2996,8 @@ impl ModePanel {
             if hits.is_empty() {
                 if c == Cat::Calc {
                     page.append(&calc_help());
+                } else if c == Cat::Clip {
+                    page.append(&clip_help());
                 } else {
                     let none = Label::new(Some("Nothing found"));
                     none.add_css_class("sugg-empty-sub");
@@ -2506,7 +3005,7 @@ impl ModePanel {
                     page.append(&none);
                 }
             } else {
-                for h in hits.iter().take(PAGE_MAX) {
+                for h in hits.iter().take(page_limit(c)) {
                     page.append(&hit_button(h, &self.window));
                 }
             }
@@ -2522,6 +3021,29 @@ impl ModePanel {
             }
         }
         self.apply_selection();
+    }
+
+    fn delete_current(&self) -> bool {
+        if !self.focused.get() {
+            return false;
+        }
+        let hits = self.visible_hits();
+        let idx = self.sel.get().unwrap_or(0);
+        let Some(line) = hits.get(idx).and_then(|h| h.clip_line.clone()) else {
+            return false;
+        };
+
+        {
+            let mut res = self.results.borrow_mut();
+            for v in res.iter_mut() {
+                v.retain(|h| h.clip_line.as_deref() != Some(line.as_str()));
+            }
+        }
+        self.sel.set(Some(idx));
+        self.render();
+
+        std::thread::spawn(move || cliphist_delete(&line));
+        true
     }
 
     fn activate_current(&self) -> bool {
@@ -2815,6 +3337,11 @@ fn build_window(
                     gtk4::gdk::Key::Up => {
                         ui.panel.move_hit(-1);
                         return glib::Propagation::Stop;
+                    }
+                    gtk4::gdk::Key::Delete | gtk4::gdk::Key::KP_Delete => {
+                        if ui.panel.delete_current() {
+                            return glib::Propagation::Stop;
+                        }
                     }
                     gtk4::gdk::Key::Left | gtk4::gdk::Key::Right => {
                         if ui.panel.mode_focused() {
@@ -3148,8 +3675,7 @@ fn build_window(
             padding: 2px 9px;
             border-radius: 20px;
             background-color: rgba(255, 255, 255, 0.1);
-            font-family: monospace;
-            font-size: 12px;
+            font-size: 16px;
             color: rgba(253, 253, 253, 0.85);
         }
         .help-chips flowboxchild {
