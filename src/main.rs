@@ -3,17 +3,18 @@ use gtk4::gdk::Display;
 use gtk4::gio::{self, AppInfo};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image, Label,
-    Overlay, Picture, ScrolledWindow, SelectionMode, Box as GtkBox,
+    glib, pango, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image,
+    Label, Overlay, Picture, ScrolledWindow, SelectionMode, Stack, StackTransitionType, Box as GtkBox,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::process::exit;
@@ -22,10 +23,31 @@ use self_update::cargo_crate_version;
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
 const SUGGEST_COUNT: usize = 5;
-const SEARCH_RESULTS: usize = 3;
+const SEARCH_RESULTS: usize = 4;
 const LOGO_TEXT: &str = "alt●";
 const SEARCH_GLYPH: &str = "";
 const LAUNCH_ANIM_US: i64 = 300_000;
+
+const PANEL_HEIGHT: i32 = 320;
+const PAGE_MAX: usize = 8;
+const FILE_DEPTH: usize = 5;
+const FILE_SCAN_LIMIT: usize = 40_000;
+const FILE_MIN_QUERY: usize = 2;
+const CLIP_KEEP: usize = 50;
+const CLIP_MAX_BYTES: usize = 10_000;
+const FILE_SKIP_DIRS: [&str; 5] = ["node_modules", "target", "venv", "__pycache__", "site-packages"];
+
+/// terminals offered for Terminal=true apps: (binary, args placed before the app's command)
+const TERMINALS: [(&str, &[&str]); 2] = [("kitty", &[]), ("xterm", &["-e"])];
+
+/// (label, icon, shell command) -- edit this list to add your own pills
+const PILLS: [(&str, &str, &str); 5] = [
+    ("Lock", "system-lock-screen", "loginctl lock-session"),
+    ("Suspend", "system-suspend", "systemctl suspend"),
+    ("Log out", "system-log-out", "niri msg action quit --skip-confirmation"),
+    ("Restart", "system-reboot", "systemctl reboot"),
+    ("Power off", "system-shutdown", "systemctl poweroff"),
+];
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
@@ -434,6 +456,241 @@ fn make_app_button(info: AppInfo, window: &ApplicationWindow) -> Button {
     button
 }
 
+fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn in_path(bin: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|d| {
+        std::fs::metadata(d.join(bin))
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
+fn installed_terminals() -> Vec<&'static str> {
+    TERMINALS.iter().map(|(n, _)| *n).filter(|n| in_path(n)).collect()
+}
+
+/// the app's .desktop file, loaded the same way build_resolver does (no DesktopAppInfo needed)
+fn desktop_keyfile(info: &AppInfo) -> Option<glib::KeyFile> {
+    let id = info.id()?;
+    let kf = glib::KeyFile::new();
+    kf.load_from_data_dirs(format!("applications/{id}"), glib::KeyFileFlags::NONE)
+        .ok()?;
+    Some(kf)
+}
+
+fn is_terminal_app(info: &AppInfo) -> bool {
+    desktop_keyfile(info)
+        .and_then(|kf| kf.boolean("Desktop Entry", "Terminal").ok())
+        .unwrap_or(false)
+}
+
+/// minimal shell-style splitter for Exec= lines (quotes + backslashes)
+fn split_exec(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_tok = false;
+    let mut quote: Option<char> = None;
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else if c == '\\' && q == '"' {
+                    if let Some(n) = it.next() {
+                        cur.push(n);
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    in_tok = true;
+                }
+                '\\' => {
+                    if let Some(n) = it.next() {
+                        cur.push(n);
+                        in_tok = true;
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if in_tok {
+                        out.push(std::mem::take(&mut cur));
+                        in_tok = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    in_tok = true;
+                }
+            },
+        }
+    }
+    if in_tok {
+        out.push(cur);
+    }
+    out
+}
+
+fn terminal_app_argv(info: &AppInfo) -> Option<Vec<String>> {
+    let kf = desktop_keyfile(info)?;
+    let exec = kf.string("Desktop Entry", "Exec").ok()?.to_string();
+    let argv: Vec<String> = split_exec(&exec)
+        .into_iter()
+        .filter(|a| !(a.len() == 2 && a.starts_with('%') && !a.starts_with("%%")))
+        .map(|a| a.replace("%%", "%"))
+        .collect();
+    Some(argv)
+}
+
+fn run_app(info: &AppInfo, term: Option<&'static str>) -> Result<(), String> {
+    match term {
+        Some(t) => {
+            let argv = terminal_app_argv(info).ok_or_else(|| "no Exec line".to_string())?;
+            if argv.is_empty() {
+                return Err("empty Exec line".to_string());
+            }
+            let flags: &[&str] = TERMINALS
+                .iter()
+                .find(|(n, _)| *n == t)
+                .map(|(_, f)| *f)
+                .unwrap_or(&[]);
+            let mut cmd = Command::new(t);
+            cmd.args(flags).args(&argv);
+            spawn_detached(&mut cmd).map_err(|e| e.to_string())
+        }
+        None => info
+            .launch(&[], None::<&gio::AppLaunchContext>)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+fn picker_widget(window: &ApplicationWindow) -> Option<gtk4::Widget> {
+    let overlay = window.child().and_downcast::<Overlay>()?;
+    let mut c = overlay.first_child();
+    while let Some(w) = c {
+        if w.has_css_class("term-pick") {
+            return Some(w);
+        }
+        c = w.next_sibling();
+    }
+    None
+}
+
+fn close_picker(window: &ApplicationWindow) -> bool {
+    let Some(p) = picker_widget(window) else {
+        return false;
+    };
+    if let Some(o) = window.child().and_downcast::<Overlay>() {
+        o.remove_overlay(&p);
+    }
+    true
+}
+
+fn collect_buttons(w: &gtk4::Widget, out: &mut Vec<Button>) {
+    if let Ok(b) = w.clone().downcast::<Button>() {
+        out.push(b);
+        return;
+    }
+    let mut c = w.first_child();
+    while let Some(ch) = c {
+        collect_buttons(&ch, out);
+        c = ch.next_sibling();
+    }
+}
+
+fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, terms: Vec<&'static str>) {
+    let Some(overlay) = window.child().and_downcast::<Overlay>() else {
+        start_launch(info, source, window, terms.first().copied());
+        return;
+    };
+    if picker_widget(window).is_some() {
+        return;
+    }
+
+    let picker = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk4::Align::Center)
+        .valign(gtk4::Align::Center)
+        .css_classes(["term-pick"])
+        .build();
+
+    let title = Label::new(Some(&format!("Open {} with", info.display_name())));
+    title.add_css_class("term-pick-title");
+    picker.append(&title);
+
+    let row = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(10)
+        .halign(gtk4::Align::Center)
+        .build();
+
+    let mut first: Option<Button> = None;
+    for (i, t) in terms.iter().enumerate() {
+        let b = Button::with_label(&format!("{}  {}", i + 1, t));
+        b.add_css_class("term-btn");
+        let (info, source, win, overlay, weak, t) = (
+            info.clone(),
+            source.clone(),
+            window.clone(),
+            overlay.clone(),
+            picker.downgrade(),
+            *t,
+        );
+        b.connect_clicked(move |_| {
+            if let Some(p) = weak.upgrade() {
+                overlay.remove_overlay(&p);
+            }
+            start_launch(&info, &source, &win, Some(t));
+        });
+        row.append(&b);
+        if first.is_none() {
+            first = Some(b);
+        }
+    }
+    picker.append(&row);
+
+    let hint = Label::new(Some("Esc to cancel"));
+    hint.add_css_class("sugg-empty-sub");
+    picker.append(&hint);
+
+    overlay.add_overlay(&picker);
+    if let Some(b) = first {
+        b.grab_focus();
+    }
+}
+
+fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) {
+    if is_terminal_app(info) {
+        let terms = installed_terminals();
+        match terms.len() {
+            0 => {}
+            1 => {
+                start_launch(info, source, window, Some(terms[0]));
+                return;
+            }
+            _ => {
+                ask_terminal(info, source, window, terms);
+                return;
+            }
+        }
+    }
+    start_launch(info, source, window, None);
+}
+
 fn reset_launch(window: &ApplicationWindow) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
         return;
@@ -442,7 +699,7 @@ fn reset_launch(window: &ApplicationWindow) {
     let mut c = overlay.first_child();
     while let Some(w) = c {
         c = w.next_sibling();
-        if w.has_css_class("launch-ghost") {
+        if w.has_css_class("launch-ghost") || w.has_css_class("term-pick") {
             ghosts.push(w);
         }
     }
@@ -455,9 +712,9 @@ fn reset_launch(window: &ApplicationWindow) {
     }
 }
 
-fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) {
+fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, term: Option<&'static str>) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
-        let _ = info.launch(&[], None::<&gio::AppLaunchContext>);
+        let _ = run_app(info, term);
         window.set_visible(false);
         return;
     };
@@ -465,7 +722,7 @@ fn launch_animated(info: &AppInfo, source: &Button, window: &ApplicationWindow) 
         return;
     }
 
-    if let Err(e) = info.launch(&[], None::<&gio::AppLaunchContext>) {
+    if let Err(e) = run_app(info, term) {
         eprintln!("Failed to launch {}: {}", info.display_name(), e);
         window.set_visible(false);
         return;
@@ -814,6 +1071,808 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
     suggbox.append(&row);
 }
 
+
+// ───────────────────── mode panel: Files / Web / Calc / Clipboard / Pills ─────────────────────
+
+/// "relevant" = fuzzy match that is not just a loose scatter of letters
+fn relevant(query: &str, text: &str) -> Option<i32> {
+    let qn = query.chars().filter(|c| !c.is_whitespace()).count() as i32;
+    let s = fuzzy_score(query, text)?;
+    if s >= 14 * qn { Some(s) } else { None }
+}
+
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b' ' => "+".to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect()
+}
+
+fn copy_text(text: &str) {
+    if let Some(d) = Display::default() {
+        d.clipboard().set_text(text);
+    }
+}
+
+// ---- calculator (no extra crates): + - * / % ^ ( ) , pi e, sqrt sin cos tan ln log abs exp floor ceil round ----
+
+struct CalcParser {
+    s: Vec<char>,
+    i: usize,
+    ops: usize,
+}
+
+impl CalcParser {
+    fn peek(&mut self) -> Option<char> {
+        while self.i < self.s.len() && self.s[self.i].is_whitespace() {
+            self.i += 1;
+        }
+        self.s.get(self.i).copied()
+    }
+
+    fn expr(&mut self) -> Option<f64> {
+        let mut v = self.term()?;
+        while let Some(c) = self.peek() {
+            match c {
+                '+' => {
+                    self.i += 1;
+                    self.ops += 1;
+                    v += self.term()?;
+                }
+                '-' => {
+                    self.i += 1;
+                    self.ops += 1;
+                    v -= self.term()?;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+
+    fn term(&mut self) -> Option<f64> {
+        let mut v = self.unary()?;
+        while let Some(c) = self.peek() {
+            match c {
+                '*' | '×' => {
+                    self.i += 1;
+                    self.ops += 1;
+                    v *= self.unary()?;
+                }
+                '/' | '÷' => {
+                    self.i += 1;
+                    self.ops += 1;
+                    v /= self.unary()?;
+                }
+                '%' => {
+                    self.i += 1;
+                    self.ops += 1;
+                    v %= self.unary()?;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+
+    fn unary(&mut self) -> Option<f64> {
+        match self.peek()? {
+            '-' => {
+                self.i += 1;
+                self.ops += 1;
+                Some(-self.unary()?)
+            }
+            '+' => {
+                self.i += 1;
+                self.unary()
+            }
+            _ => self.power(),
+        }
+    }
+
+    fn power(&mut self) -> Option<f64> {
+        let base = self.atom()?;
+        if self.peek() == Some('^') {
+            self.i += 1;
+            self.ops += 1;
+            let e = self.unary()?;
+            return Some(base.powf(e));
+        }
+        Some(base)
+    }
+
+    fn atom(&mut self) -> Option<f64> {
+        let c = self.peek()?;
+        if c == '(' {
+            self.i += 1;
+            let v = self.expr()?;
+            if self.peek() != Some(')') {
+                return None;
+            }
+            self.i += 1;
+            return Some(v);
+        }
+        if c.is_ascii_digit() || c == '.' {
+            let st = self.i;
+            while self.i < self.s.len() && (self.s[self.i].is_ascii_digit() || self.s[self.i] == '.') {
+                self.i += 1;
+            }
+            let t: String = self.s[st..self.i].iter().collect();
+            return t.parse().ok();
+        }
+        if c.is_alphabetic() {
+            let st = self.i;
+            while self.i < self.s.len() && self.s[self.i].is_alphabetic() {
+                self.i += 1;
+            }
+            let name: String = self.s[st..self.i].iter().collect::<String>().to_lowercase();
+            match name.as_str() {
+                "pi" => return Some(std::f64::consts::PI),
+                "e" => return Some(std::f64::consts::E),
+                _ => {}
+            }
+            if self.peek() != Some('(') {
+                return None;
+            }
+            self.i += 1;
+            let a = self.expr()?;
+            if self.peek() != Some(')') {
+                return None;
+            }
+            self.i += 1;
+            self.ops += 1;
+            return match name.as_str() {
+                "sqrt" => Some(a.sqrt()),
+                "sin" => Some(a.sin()),
+                "cos" => Some(a.cos()),
+                "tan" => Some(a.tan()),
+                "ln" => Some(a.ln()),
+                "log" => Some(a.log10()),
+                "abs" => Some(a.abs()),
+                "exp" => Some(a.exp()),
+                "floor" => Some(a.floor()),
+                "ceil" => Some(a.ceil()),
+                "round" => Some(a.round()),
+                _ => None,
+            };
+        }
+        None
+    }
+}
+
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        let s = format!("{:.10}", v);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// None unless the query is a real expression (a bare "5" or "pi" is not "relevant")
+fn calc(q: &str) -> Option<String> {
+    let q = q.trim().trim_start_matches('=');
+    let mut p = CalcParser { s: q.chars().collect(), i: 0, ops: 0 };
+    let v = p.expr()?;
+    if p.peek().is_some() || p.ops == 0 || !v.is_finite() {
+        return None;
+    }
+    Some(fmt_num(v))
+}
+
+// ---- files: breadth-first walk of $HOME, aborts as soon as a newer query starts ----
+
+fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((home, 0));
+    let mut best: Vec<(i32, PathBuf)> = Vec::new();
+    let mut visited = 0_usize;
+
+    'walk: while let Some((dir, depth)) = queue.pop_front() {
+        if generation.load(Ordering::Relaxed) != mine {
+            return Vec::new();
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            visited += 1;
+            if visited > FILE_SCAN_LIMIT {
+                break 'walk;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_dir() && depth < FILE_DEPTH && !FILE_SKIP_DIRS.contains(&name.as_str()) {
+                queue.push_back((e.path(), depth + 1));
+            }
+            if let Some(s) = relevant(q, &name) {
+                best.push((s, e.path()));
+            }
+        }
+        if best.len() > 400 {
+            best.sort_by(|a, b| b.0.cmp(&a.0));
+            best.truncate(PAGE_MAX * 4);
+        }
+    }
+
+    best.sort_by(|a, b| b.0.cmp(&a.0));
+    best.truncate(PAGE_MAX);
+    best.into_iter().map(|(_, p)| p).collect()
+}
+
+// ---- clipboard history (memory only, never written to disk) ----
+
+fn watch_clipboard(display: &Display, hist: Rc<RefCell<VecDeque<String>>>) {
+    let cb = display.clipboard();
+
+    let grab = {
+        let cb = cb.clone();
+        move || {
+            let cb = cb.clone();
+            let hist = hist.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(Some(t)) = cb.read_text_future().await {
+                    let t = t.to_string();
+                    if t.trim().is_empty() || t.len() > CLIP_MAX_BYTES {
+                        return;
+                    }
+                    let mut h = hist.borrow_mut();
+                    h.retain(|x| x != &t);
+                    h.push_front(t);
+                    h.truncate(CLIP_KEEP);
+                }
+            });
+        }
+    };
+
+    grab();
+    cb.connect_changed(move |_| grab());
+}
+
+// ---- hits ----
+
+#[derive(Clone)]
+struct Hit {
+    title: String,
+    subtitle: String,
+    icon: String,
+    action: Rc<dyn Fn()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cat {
+    Files,
+    Web,
+    Calc,
+    Clip,
+    Pills,
+}
+
+impl Cat {
+    const ALL: [Cat; 5] = [Cat::Files, Cat::Web, Cat::Calc, Cat::Clip, Cat::Pills];
+
+    fn idx(self) -> usize {
+        self as usize
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Cat::Files => "files",
+            Cat::Web => "web",
+            Cat::Calc => "calc",
+            Cat::Clip => "clip",
+            Cat::Pills => "pills",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Cat::Files => "Files",
+            Cat::Web => "Web results",
+            Cat::Calc => "Calculator",
+            Cat::Clip => "Clipboard",
+            Cat::Pills => "Pills",
+        }
+    }
+}
+
+fn pretty_dir(p: &std::path::Path) -> String {
+    let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && dir.starts_with(&home) {
+        format!("~{}", &dir[home.len()..])
+    } else {
+        dir
+    }
+}
+
+fn file_hits(paths: Vec<PathBuf>) -> Vec<Hit> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let uri = gio::File::for_path(&p).uri().to_string();
+            Hit {
+                title: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                subtitle: pretty_dir(&p),
+                icon: if p.is_dir() { "folder" } else { "text-x-generic" }.to_string(),
+                action: Rc::new(move || {
+                    let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                }),
+            }
+        })
+        .collect()
+}
+
+// TODO: real web results need an HTTP client + a search API; for now this is one "search the web" hit
+fn web_hits(q: &str) -> Vec<Hit> {
+    let q = q.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let uri = format!("https://duckduckgo.com/?q={}", url_encode(q));
+    vec![Hit {
+        title: format!("Search the web for “{q}”"),
+        subtitle: "duckduckgo.com".to_string(),
+        icon: "applications-internet".to_string(),
+        action: Rc::new(move || {
+            let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+        }),
+    }]
+}
+
+fn calc_hits(q: &str) -> Vec<Hit> {
+    match calc(q) {
+        Some(res) => vec![Hit {
+            title: format!("= {res}"),
+            subtitle: "Enter to copy the result".to_string(),
+            icon: "accessories-calculator".to_string(),
+            action: Rc::new(move || copy_text(&res)),
+        }],
+        None => Vec::new(),
+    }
+}
+
+fn clip_hits(q: &str, hist: &VecDeque<String>) -> Vec<Hit> {
+    let ql = q.trim().to_lowercase();
+    if ql.is_empty() {
+        return Vec::new();
+    }
+    hist.iter()
+        .filter(|t| t.to_lowercase().contains(&ql))
+        .take(PAGE_MAX)
+        .map(|t| {
+            let first = t.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+            let text = t.clone();
+            Hit {
+                title: first,
+                subtitle: "Clipboard · Enter to copy again".to_string(),
+                icon: "edit-paste".to_string(),
+                action: Rc::new(move || copy_text(&text)),
+            }
+        })
+        .collect()
+}
+
+fn pill_hits(q: &str) -> Vec<Hit> {
+    let mut v: Vec<(i32, Hit)> = PILLS
+        .iter()
+        .filter_map(|(name, icon, cmd)| {
+            let s = relevant(q, name)?;
+            let cmd = cmd.to_string();
+            Some((
+                s,
+                Hit {
+                    title: name.to_string(),
+                    subtitle: cmd.clone(),
+                    icon: icon.to_string(),
+                    action: Rc::new(move || {
+                        let mut c = Command::new("sh");
+                        c.arg("-c").arg(&cmd);
+                        let _ = spawn_detached(&mut c);
+                    }),
+                },
+            ))
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.into_iter().map(|(_, h)| h).collect()
+}
+
+fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
+    let icon = Image::from_icon_name(&hit.icon);
+    icon.set_pixel_size(28);
+
+    let title = Label::new(Some(&hit.title));
+    title.add_css_class("hit-title");
+    title.set_xalign(0.0);
+    title.set_ellipsize(pango::EllipsizeMode::End);
+    title.set_max_width_chars(70);
+
+    let sub = Label::new(Some(&hit.subtitle));
+    sub.add_css_class("hit-sub");
+    sub.set_xalign(0.0);
+    sub.set_ellipsize(pango::EllipsizeMode::Middle);
+    sub.set_max_width_chars(80);
+
+    let text = GtkBox::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(1)
+        .valign(gtk4::Align::Center)
+        .build();
+    text.append(&title);
+    text.append(&sub);
+
+    let row = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).build();
+    row.append(&icon);
+    row.append(&text);
+
+    let button = Button::builder().child(&row).hexpand(true).build();
+    button.add_css_class("flat");
+    button.add_css_class("hit-row");
+
+    let action = hit.action.clone();
+    let win = window.clone();
+    button.connect_clicked(move |_| {
+        action();
+        win.set_visible(false);
+    });
+    button
+}
+
+fn clear_box(b: &GtkBox) {
+    while let Some(child) = b.first_child() {
+        b.remove(&child);
+    }
+}
+
+fn select_page(stack: &Stack, tabs: &[(&'static str, Button)], id: &str) {
+    stack.set_visible_child_name(id);
+    for (tid, b) in tabs {
+        if *tid == id {
+            b.add_css_class("active");
+        } else {
+            b.remove_css_class("active");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ModePanel {
+    window: ApplicationWindow,
+    stack: Stack,
+    tabs: Vec<(&'static str, Button)>,
+    home: GtkBox,
+    pages: Vec<GtkBox>,
+    results: Rc<RefCell<Vec<Vec<Hit>>>>,
+    clip: Rc<RefCell<VecDeque<String>>>,
+    generation: Arc<AtomicU64>,
+    apps_box: GtkBox,
+    hits_scroller: ScrolledWindow,
+    sel: Rc<Cell<Option<usize>>>,
+    focused: Rc<Cell<bool>>,
+}
+
+impl ModePanel {
+    fn new(window: &ApplicationWindow, host: &GtkBox, display: &Display, apps_box: &GtkBox) -> Self {
+        let clip = Rc::new(RefCell::new(VecDeque::new()));
+        watch_clipboard(display, clip.clone());
+
+        let stack = Stack::builder()
+            .transition_type(StackTransitionType::Crossfade)
+            .transition_duration(120)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+
+        let make_page = || {
+            GtkBox::builder()
+                .orientation(gtk4::Orientation::Vertical)
+                .spacing(4)
+                .margin_start(20)
+                .margin_end(20)
+                .margin_top(10)
+                .margin_bottom(14)
+                .valign(gtk4::Align::Start)
+                .build()
+        };
+
+        let home = make_page();
+        stack.add_named(&home, Some("home"));
+        let mut pages = Vec::new();
+        for c in Cat::ALL {
+            let p = make_page();
+            stack.add_named(&p, Some(c.id()));
+            pages.push(p);
+        }
+
+        let tabbar = GtkBox::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(20)
+            .margin_end(20)
+            .margin_top(12)
+            .css_classes(["mode-tabs"])
+            .build();
+
+        let mut tabs: Vec<(&'static str, Button)> = Vec::new();
+        let labels = std::iter::once(("home", "Home")).chain(Cat::ALL.iter().map(|c| (c.id(), c.title())));
+        for (id, label) in labels {
+            let b = Button::with_label(label);
+            b.add_css_class("flat");
+            b.add_css_class("mode-tab");
+            tabbar.append(&b);
+            tabs.push((id, b));
+        }
+        select_page(&stack, &tabs, "home");
+
+        let scroller = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Never)
+            .vscrollbar_policy(gtk4::PolicyType::Automatic)
+            .min_content_height(PANEL_HEIGHT)
+            .max_content_height(PANEL_HEIGHT)
+            .vexpand(true)
+            .child(&stack)
+            .build();
+
+        host.append(&tabbar);
+        host.append(&scroller);
+
+        let panel = Self {
+            window: window.clone(),
+            stack,
+            tabs,
+            home,
+            pages,
+            results: Rc::new(RefCell::new(vec![Vec::new(); Cat::ALL.len()])),
+            clip,
+            generation: Arc::new(AtomicU64::new(0)),
+            apps_box: apps_box.clone(),
+            hits_scroller: scroller,
+            sel: Rc::new(Cell::new(None)),
+            focused: Rc::new(Cell::new(false)),
+        };
+
+        for (id, b) in panel.tabs.clone() {
+            let p = panel.clone();
+            b.connect_clicked(move |_| p.select(id));
+        }
+        panel
+    }
+
+    fn select(&self, id: &str) {
+        select_page(&self.stack, &self.tabs, id);
+        self.hits_scroller.vadjustment().set_value(0.0);
+        self.focused.set(false);
+        self.sel.set(None);
+        self.apply_selection();
+    }
+
+    fn mode_focused(&self) -> bool {
+        self.focused.get()
+    }
+
+    /// hits shown on the visible page, in the same order as their rows
+    fn visible_hits(&self) -> Vec<Hit> {
+        let name = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let res = self.results.borrow();
+        if name.is_empty() || name == "home" {
+            Cat::ALL.iter().filter_map(|c| res[c.idx()].first().cloned()).collect()
+        } else {
+            Cat::ALL
+                .iter()
+                .find(|c| c.id() == name)
+                .map(|c| res[c.idx()].iter().take(PAGE_MAX).cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    fn visible_rows(&self) -> Vec<gtk4::Widget> {
+        let name = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let page = match Cat::ALL.iter().position(|c| c.id() == name) {
+            Some(i) => self.pages[i].clone(),
+            None => self.home.clone(),
+        };
+        let mut rows = Vec::new();
+        let mut c = page.first_child();
+        while let Some(w) = c {
+            c = w.next_sibling();
+            if w.has_css_class("hit-row") {
+                rows.push(w);
+            }
+        }
+        rows
+    }
+
+    fn scroll_to(&self, row: &gtk4::Widget) {
+        let adj = self.hits_scroller.vadjustment();
+        if let Some(b) = row.compute_bounds(&self.stack) {
+            let (y, h) = (b.y() as f64, b.height() as f64);
+            let (top, page) = (adj.value(), adj.page_size());
+            if y < top {
+                adj.set_value((y - 8.0).max(0.0));
+            } else if y + h > top + page {
+                adj.set_value(y + h - page + 8.0);
+            }
+        }
+    }
+
+    fn apply_selection(&self) {
+        let rows = self.visible_rows();
+        if self.focused.get() && rows.is_empty() {
+            self.focused.set(false);
+        }
+        let cur = if self.focused.get() {
+            Some(self.sel.get().unwrap_or(0).min(rows.len().saturating_sub(1)))
+        } else {
+            None
+        };
+        self.sel.set(cur);
+
+        for (i, r) in rows.iter().enumerate() {
+            if Some(i) == cur {
+                r.add_css_class("hit-sel");
+            } else {
+                r.remove_css_class("hit-sel");
+            }
+        }
+        if self.focused.get() {
+            self.apps_box.add_css_class("mode-focus");
+        } else {
+            self.apps_box.remove_css_class("mode-focus");
+        }
+        if let Some(i) = cur {
+            self.scroll_to(&rows[i]);
+        }
+    }
+
+    /// back to the app results (left / right, or up from the first mode result)
+    fn focus_apps(&self) {
+        self.focused.set(false);
+        self.sel.set(None);
+        self.apply_selection();
+    }
+
+    /// down: apps -> first mode result -> next ...; up: previous, and from the first one back to apps
+    fn move_hit(&self, delta: i32) {
+        let n = self.visible_rows().len();
+        if n == 0 {
+            return;
+        }
+        if !self.focused.get() {
+            if delta > 0 {
+                self.focused.set(true);
+                self.sel.set(Some(0));
+                self.apply_selection();
+            }
+            return;
+        }
+        let cur = self.sel.get().unwrap_or(0);
+        if delta < 0 {
+            if cur == 0 {
+                self.focus_apps();
+                return;
+            }
+            self.sel.set(Some(cur - 1));
+        } else {
+            self.sel.set(Some((cur + 1).min(n - 1)));
+        }
+        self.apply_selection();
+    }
+
+    fn is_home(&self) -> bool {
+        self.stack.visible_child_name().map_or(true, |n| n == "home")
+    }
+
+    fn next_page(&self, delta: i32) {
+        let cur = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let i = self.tabs.iter().position(|(id, _)| *id == cur).unwrap_or(0) as i32;
+        let n = (i + delta).rem_euclid(self.tabs.len() as i32) as usize;
+        self.select(self.tabs[n].0);
+    }
+
+    fn reset(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for r in self.results.borrow_mut().iter_mut() {
+            r.clear();
+        }
+        self.select("home");
+        self.render();
+    }
+
+    fn search(&self, q: &str) {
+        let q = q.trim().to_string();
+        let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.focused.set(false);
+        self.sel.set(None);
+
+        {
+            let mut r = self.results.borrow_mut();
+            r[Cat::Files.idx()].clear();
+            r[Cat::Web.idx()] = web_hits(&q);
+            r[Cat::Calc.idx()] = calc_hits(&q);
+            r[Cat::Clip.idx()] = clip_hits(&q, &self.clip.borrow());
+            r[Cat::Pills.idx()] = pill_hits(&q);
+        }
+        self.render();
+
+        if q.chars().count() >= FILE_MIN_QUERY {
+            let (tx, rx) = async_channel::bounded::<Vec<PathBuf>>(1);
+            let generation = self.generation.clone();
+            let qq = q.clone();
+            std::thread::spawn(move || {
+                let found = search_files(&qq, &generation, mine);
+                let _ = tx.send_blocking(found);
+            });
+
+            let panel = self.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(paths) = rx.recv().await {
+                    if panel.generation.load(Ordering::SeqCst) == mine {
+                        panel.results.borrow_mut()[Cat::Files.idx()] = file_hits(paths);
+                        panel.render();
+                    }
+                }
+            });
+        }
+    }
+
+    fn render(&self) {
+        let res = self.results.borrow();
+        clear_box(&self.home);
+
+        for c in Cat::ALL {
+            let hits = &res[c.idx()];
+            let page = &self.pages[c.idx()];
+            clear_box(page);
+
+            // home: top hit of each category, nothing at all for empty ones
+            if let Some(top) = hits.first() {
+                let head = Label::new(Some(c.title()));
+                head.add_css_class("hit-cat");
+                head.set_halign(gtk4::Align::Start);
+                self.home.append(&head);
+                self.home.append(&hit_button(top, &self.window));
+            }
+
+            if hits.is_empty() {
+                let none = Label::new(Some("Nothing found"));
+                none.add_css_class("sugg-empty-sub");
+                none.set_halign(gtk4::Align::Start);
+                page.append(&none);
+            } else {
+                for h in hits.iter().take(PAGE_MAX) {
+                    page.append(&hit_button(h, &self.window));
+                }
+            }
+        }
+        self.apply_selection();
+    }
+
+    /// runs the selected hit of the visible page (first one if none is selected)
+    fn activate_current(&self) -> bool {
+        let hits = self.visible_hits();
+        let idx = self.sel.get().unwrap_or(0);
+        match hits.get(idx).or(hits.first()) {
+            Some(h) => {
+                let a = h.action.clone();
+                a();
+                self.window.set_visible(false);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SearchUi {
     entry: GtkEntry,
@@ -822,6 +1881,7 @@ struct SearchUi {
     apps_title: Label,
     scroller: ScrolledWindow,
     mode_panel: GtkBox,
+    panel: ModePanel,
     anchor: GtkBox,
 }
 
@@ -837,6 +1897,7 @@ impl SearchUi {
         self.apps_title.set_visible(false);
         self.scroller.set_visible(false);
         self.mode_panel.set_visible(true);
+        self.panel.select("home");
     }
 
     fn exit(&self) {
@@ -847,6 +1908,7 @@ impl SearchUi {
         self.apps_title.set_visible(true);
         self.scroller.set_visible(true);
         self.mode_panel.set_visible(false);
+        self.panel.reset();
         self.anchor.grab_focus();
     }
 }
@@ -885,7 +1947,7 @@ fn build_window(
         .application(app)
         .title("alt.")
         .default_width(800)
-        .default_height(560)
+        // .default_height(560)
         .resizable(false)
         .decorated(false)
         .css_classes(["win"])
@@ -942,6 +2004,7 @@ fn build_window(
         .child(&grid)
         .hexpand(true)
         .vexpand(true)
+        .height_request(360)
         .build();
 
     let topbox = GtkBox::builder()
@@ -1014,6 +2077,9 @@ fn build_window(
         .build();
     card.append(&mode_panel);
 
+    let display = Display::default().expect("no display");
+    let panel = ModePanel::new(&window, &mode_panel, &display, &suggestionbox);
+
     let search = SearchUi {
         entry: search_entry,
         logo: altdotlabel,
@@ -1021,6 +2087,7 @@ fn build_window(
         apps_title: allappstitle,
         scroller: scroller.clone(),
         mode_panel,
+        panel,
         anchor: card.clone(),
     };
 
@@ -1037,6 +2104,28 @@ fn build_window(
         let ui = search.clone();
         let u = usage.clone();
         keys.connect_key_pressed(move |_, key, _, state| {
+            if let Some(p) = picker_widget(&win) {
+                if key == gtk4::gdk::Key::Escape {
+                    close_picker(&win);
+                    if ui.active() {
+                        ui.entry.grab_focus();
+                    } else {
+                        ui.anchor.grab_focus();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                if let Some(n) = key.to_unicode().and_then(|c| c.to_digit(10)) {
+                    let mut btns = Vec::new();
+                    collect_buttons(&p, &mut btns);
+                    if n >= 1 {
+                        if let Some(b) = btns.get((n - 1) as usize) {
+                            b.emit_clicked();
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                return glib::Propagation::Proceed;
+            }
             if key == gtk4::gdk::Key::Escape {
                 if ui.active() {
                     ui.exit();
@@ -1046,15 +2135,31 @@ fn build_window(
                 }
                 return glib::Propagation::Stop;
             }
+            if ui.active() && (key == gtk4::gdk::Key::Tab || key == gtk4::gdk::Key::ISO_Left_Tab) {
+                ui.panel.next_page(if key == gtk4::gdk::Key::ISO_Left_Tab { -1 } else { 1 });
+                return glib::Propagation::Stop;
+            }
             if ui.active() {
-                let step = match key {
-                    gtk4::gdk::Key::Left | gtk4::gdk::Key::Up => Some(-1),
-                    gtk4::gdk::Key::Right | gtk4::gdk::Key::Down => Some(1),
-                    _ => None,
-                };
-                if let Some(d) = step {
-                    move_selection(&sugg, d);
-                    return glib::Propagation::Stop;
+                match key {
+                    // up / down walk the mode-panel results
+                    gtk4::gdk::Key::Down => {
+                        ui.panel.move_hit(1);
+                        return glib::Propagation::Stop;
+                    }
+                    gtk4::gdk::Key::Up => {
+                        ui.panel.move_hit(-1);
+                        return glib::Propagation::Stop;
+                    }
+                    // left / right: back to the app results, then move through them
+                    gtk4::gdk::Key::Left | gtk4::gdk::Key::Right => {
+                        if ui.panel.mode_focused() {
+                            ui.panel.focus_apps();
+                        } else {
+                            move_selection(&sugg, if key == gtk4::gdk::Key::Left { -1 } else { 1 });
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                    _ => {}
                 }
             }
 
@@ -1068,16 +2173,17 @@ fn build_window(
                     .filter(|c| !c.is_control() && !c.is_whitespace())
                 {
                     if c.is_numeric() {
-                        if !ui.active() {
-                            if let Some(n) = c.to_digit(10) {
-                                if (1..=SUGGEST_COUNT as u32).contains(&n)
-                                    && launch_suggestion(&sugg, (n - 1) as usize)
-                                {
-                                    return glib::Propagation::Stop;
-                                }
+                        if ui.active() {
+                            return glib::Propagation::Proceed;
+                        }
+                        if let Some(n) = c.to_digit(10) {
+                            if (1..=SUGGEST_COUNT as u32).contains(&n)
+                                && launch_suggestion(&sugg, (n - 1) as usize)
+                            {
+                                return glib::Propagation::Stop;
                             }
                         }
-                        return glib::Propagation::Stop;
+                        // not a shortcut: fall through and start a search with the digit
                     }
 
                     if !ui.active() {
@@ -1109,16 +2215,25 @@ fn build_window(
                 refresh_suggestions(&sg, &w, &u);
             } else {
                 show_results(&sg, &w, &q);
+                ui.panel.search(&q);
             }
         });
 
         let sg = suggestionbox.clone();
+        let panel = search.panel.clone();
         search.entry.connect_activate(move |_| {
-            launch_suggestion(&sg, selected_result(&sg));
+            if panel.mode_focused() {
+                panel.activate_current();
+            } else if panel.is_home() {
+                if !launch_suggestion(&sg, selected_result(&sg)) {
+                    panel.activate_current();
+                }
+            } else {
+                panel.activate_current();
+            }
         });
     }
 
-    let display = Display::default().expect("no display");
     let slide_px = max_monitor_height(&display);
 
     let provider = CssProvider::new();
@@ -1139,7 +2254,7 @@ fn build_window(
         }
 
         .win-card {
-            background-color: rgba(47, 47, 47, 0.49);
+            background-color: rgba(10, 10, 10, 0.49);
             border-radius: 35px;
             border: 1px solid var(--pri-border);
             opacity: 0;
@@ -1256,7 +2371,7 @@ fn build_window(
         }
 
         .sugg-top {
-            border-radius: 25px;
+            border-radius: 20px;
             background-color: rgba(255, 255, 255, 0.06);
         }
 
@@ -1269,6 +2384,77 @@ fn build_window(
             font-size: 20px;
             font-weight: 800;
             color: rgba(253, 253, 253, 0.29);
+        }
+
+        .mode-tab {
+            all: unset;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            color: rgba(253, 253, 253, 0.4);
+        }
+        .mode-tab:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        .mode-tab.active {
+            background-color: rgba(255, 255, 255, 0.12);
+            color: rgba(253, 253, 253, 0.8);
+        }
+
+        .hit-row {
+            all: unset;
+            padding: 8px 12px;
+            border-radius: 16px;
+        }
+        .hit-row:hover {
+            background-color: rgba(255, 255, 255, 0.06);
+        }
+        .hit-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: rgba(253, 253, 253, 0.7);
+        }
+        .hit-sub {
+            font-size: 11px;
+            color: rgba(253, 253, 253, 0.4);
+        }
+        .hit-cat {
+            margin: 6px 0 0 12px;
+            font-size: 11px;
+            font-weight: 300;
+            color: rgba(253, 253, 253, 0.29);
+        }
+
+        .hit-row.hit-sel {
+            background-color: rgba(255, 255, 255, 0.12);
+        }
+        .mode-focus .sugg-top {
+            background-color: transparent;
+        }
+
+        .term-pick {
+            padding: 22px 26px;
+            border-radius: 24px;
+            background-color: rgba(18, 18, 18, 0.95);
+            border: 1px solid var(--pri-border);
+        }
+        .term-pick-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: rgba(253, 253, 253, 0.7);
+        }
+        .term-btn {
+            all: unset;
+            padding: 8px 20px;
+            border-radius: 14px;
+            font-size: 13px;
+            font-weight: 600;
+            color: rgba(253, 253, 253, 0.7);
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+        .term-btn:hover, .term-btn:focus {
+            background-color: rgba(255, 255, 255, 0.2);
         }
 
         .pagetitle {
