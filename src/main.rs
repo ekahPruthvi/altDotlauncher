@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use std::process::exit;
 use self_update::cargo_crate_version;
 
@@ -35,10 +35,18 @@ const FILE_SCAN_LIMIT: usize = 40_000;
 const FILE_MIN_QUERY: usize = 2;
 const CLIP_PREVIEW_WIDTH: &str = "400";
 const CLIP_THUMB_CACHE: usize = 256;
+
+const CLIP_ENABLED: bool = true;
+const WEB_API_ENABLED: bool = true;
+const FILES_ENABLED: bool = true;
 const CLIP_ALL_MAX: usize = 200;
 const CLIP_IMG_MAX_BYTES: usize = 25_000_000;
 const CUSTOM_ICON_DIR: &str = "/var/lib/cynager/icons";
 const HIT_ICON_SIZE: i32 = 46;
+const FAST_DEBOUNCE_MS: u64 = 70;
+const MODE_DEBOUNCE_MS: u64 = 500;
+const FILE_INDEX_TTL: Duration = Duration::from_secs(120);
+const CLIP_LIST_TTL: Duration = Duration::from_millis(1500);
 const FILE_SKIP_DIRS: [&str; 5] = ["node_modules", "target", "venv", "__pycache__", "site-packages"];
 
 const TERMINALS: [(&str, &[&str]); 2] = [("kitty", &[]), ("xterm", &["-e"])];
@@ -81,22 +89,44 @@ fn search_request_path() -> PathBuf {
         .join("altDot.search")
 }
 
-static SIG_TOGGLE: AtomicBool = AtomicBool::new(false);
-static SIG_SEARCH: AtomicBool = AtomicBool::new(false);
+static SIG_PIPE_W: AtomicI32 = AtomicI32::new(-1);
 
-extern "C" fn on_sigusr1(_: libc::c_int) {
-    SIG_TOGGLE.store(true, Ordering::SeqCst);
-}
-
-extern "C" fn on_sigusr2(_: libc::c_int) {
-    SIG_SEARCH.store(true, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() {
-    unsafe {
-        libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGUSR2, on_sigusr2 as *const () as libc::sighandler_t);
+extern "C" fn on_signal(sig: libc::c_int) {
+    let fd = SIG_PIPE_W.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let b = sig as u8;
+        unsafe {
+            libc::write(fd, &b as *const u8 as *const libc::c_void, 1);
+        }
     }
+}
+
+fn spawn_signal_listener() -> async_channel::Receiver<i32> {
+    let (tx, rx) = async_channel::unbounded::<i32>();
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return rx;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+    SIG_PIPE_W.store(wr, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGUSR1, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR2, on_signal as *const () as libc::sighandler_t);
+    }
+    std::thread::spawn(move || loop {
+        let mut b = 0_u8;
+        let n = unsafe { libc::read(rd, &mut b as *mut u8 as *mut libc::c_void, 1) };
+        if n == 1 {
+            if tx.send_blocking(b as i32).is_err() {
+                break;
+            }
+        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            break;
+        }
+    });
+    rx
 }
 
 fn take_search_request() -> Option<String> {
@@ -242,8 +272,148 @@ fn load_apps() -> Vec<AppInfo> {
         })
         .collect();
 
-    apps.sort_by_key(|a| a.display_name().to_lowercase());
+    apps.sort_by_cached_key(|a| a.display_name().to_lowercase());
     apps
+}
+
+struct AppEntry {
+    info: AppInfo,
+    name: String,
+    name_lc: Vec<char>,
+    id_lc: Vec<char>,
+    sort_key: String,
+}
+
+thread_local! {
+    static APP_CACHE: RefCell<Option<Rc<Vec<AppInfo>>>> = RefCell::new(None);
+    static APP_INDEX: RefCell<Option<Rc<Vec<AppEntry>>>> = RefCell::new(None);
+    static GRID_STALE: Cell<bool> = Cell::new(true);
+    static APP_MONITOR: RefCell<Option<gio::AppInfoMonitor>> = RefCell::new(None);
+    static ICON_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+
+fn cached_apps() -> Rc<Vec<AppInfo>> {
+    APP_CACHE.with(|c| c.borrow_mut().get_or_insert_with(|| Rc::new(load_apps())).clone())
+}
+
+fn seed_app_cache(apps: Rc<Vec<AppInfo>>) {
+    APP_CACHE.with(|c| *c.borrow_mut() = Some(apps));
+}
+
+fn invalidate_apps() {
+    APP_CACHE.with(|c| *c.borrow_mut() = None);
+    APP_INDEX.with(|c| *c.borrow_mut() = None);
+    GRID_STALE.with(|g| g.set(true));
+}
+
+fn take_grid_stale() -> bool {
+    GRID_STALE.with(|g| g.replace(false))
+}
+
+fn watch_app_changes() {
+    let monitor = gio::AppInfoMonitor::get();
+    monitor.connect_changed(|_| invalidate_apps());
+    APP_MONITOR.with(|m| *m.borrow_mut() = Some(monitor));
+}
+
+fn lower_into(buf: &mut Vec<char>, s: &str) {
+    buf.clear();
+    buf.extend(s.chars().flat_map(|c| c.to_lowercase()));
+}
+
+fn lower_chars(s: &str) -> Vec<char> {
+    let mut v = Vec::with_capacity(s.len());
+    lower_into(&mut v, s);
+    v
+}
+
+fn app_index() -> Rc<Vec<AppEntry>> {
+    if let Some(i) = APP_INDEX.with(|c| c.borrow().clone()) {
+        return i;
+    }
+    let idx: Vec<AppEntry> = cached_apps()
+        .iter()
+        .map(|a| {
+            let name = a.display_name().to_string();
+            let id = a.id().map(|i| i.to_string()).unwrap_or_default();
+            AppEntry {
+                info: a.clone(),
+                name_lc: lower_chars(&name),
+                id_lc: lower_chars(id.trim_end_matches(".desktop")),
+                sort_key: name.to_lowercase(),
+                name,
+            }
+        })
+        .collect();
+    let rc = Rc::new(idx);
+    APP_INDEX.with(|c| *c.borrow_mut() = Some(rc.clone()));
+    rc
+}
+
+struct Matcher {
+    q: Vec<char>,
+    ql: Vec<char>,
+    qn: i32,
+}
+
+impl Matcher {
+    fn new(query: &str) -> Self {
+        let ql = lower_chars(query.trim());
+        let q: Vec<char> = ql.iter().copied().filter(|c| !c.is_whitespace()).collect();
+        let qn = q.len() as i32;
+        Self { q, ql, qn }
+    }
+
+    fn score(&self, t: &[char]) -> Option<i32> {
+        if self.q.is_empty() {
+            return Some(0);
+        }
+        if t.len() < self.q.len() {
+            return None;
+        }
+
+        let mut score = 0_i32;
+        let mut ti = 0_usize;
+        let mut prev: Option<usize> = None;
+
+        for &qc in &self.q {
+            let mut found = None;
+            while ti < t.len() {
+                if t[ti] == qc {
+                    found = Some(ti);
+                    ti += 1;
+                    break;
+                }
+                ti += 1;
+            }
+            let pos = found?;
+
+            score += 10;
+            match prev {
+                Some(p) if pos == p + 1 => score += 15,
+                Some(p) => score -= (pos - p - 1).min(10) as i32,
+                None => score -= pos.min(10) as i32,
+            }
+            if pos == 0 || !t[pos - 1].is_alphanumeric() {
+                score += 12;
+            }
+            prev = Some(pos);
+        }
+
+        if !self.ql.is_empty() && t.windows(self.ql.len()).any(|w| w == self.ql.as_slice()) {
+            score += 40;
+            if t.starts_with(&self.ql) {
+                score += 30;
+            }
+        }
+        score -= t.len() as i32 / 8;
+        Some(score)
+    }
+
+    fn relevant(&self, t: &[char]) -> Option<i32> {
+        let s = self.score(t)?;
+        if s >= 14 * self.qn { Some(s) } else { None }
+    }
 }
 
 fn build_resolver(apps: &[AppInfo]) -> HashMap<String, String> {
@@ -314,23 +484,31 @@ fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
                 .filter_map(|app_id| resolver.get(app_id))
                 .collect();
 
-            let mut guard = usage.lock().unwrap();
-            let u = &mut *guard;
+            let snapshot = {
+                let mut guard = usage.lock().unwrap();
+                let u = &mut *guard;
 
-            u.alive.retain(|id, _| running.contains(id));
+                u.alive.retain(|id, _| running.contains(id));
 
-            for id in running {
-                if u.alive.get(id).copied() != Some(slot) {
-                    *u.slots[slot].entry(id.clone()).or_insert(0) += 1;
-                    u.alive.insert(id.clone(), slot);
-                    u.dirty = true;
+                for id in running {
+                    if u.alive.get(id).copied() != Some(slot) {
+                        *u.slots[slot].entry(id.clone()).or_insert(0) += 1;
+                        u.alive.insert(id.clone(), slot);
+                        u.dirty = true;
+                    }
                 }
-            }
 
-            if u.dirty && last_save.elapsed().as_secs() >= SAVE_EVERY_SECS {
-                save_usage(u);
-                u.dirty = false;
-                last_save = std::time::Instant::now();
+                if u.dirty && last_save.elapsed().as_secs() >= SAVE_EVERY_SECS {
+                    u.dirty = false;
+                    Some(u.slots.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(slots) = snapshot {
+                save_usage(&Usage { slots, alive: HashMap::new(), dirty: false });
+                last_save = Instant::now();
             }
         }
     });
@@ -771,7 +949,7 @@ fn is_ide(a: &AppInfo) -> bool {
 }
 
 fn find_code_editors() -> Vec<AppInfo> {
-    let all: Vec<AppInfo> = AppInfo::all().into_iter().filter(|a| a.should_show()).collect();
+    let all: Vec<AppInfo> = cached_apps().iter().cloned().collect();
     let key = |a: &AppInfo| {
         a.id()
             .map(|i| i.trim_end_matches(".desktop").to_lowercase())
@@ -1014,7 +1192,7 @@ fn refresh_suggestions(suggbox: &GtkBox, window: &ApplicationWindow, usage: &Usa
     let ids = current_slot()
         .map(|slot| top_apps(usage, slot, SUGGEST_COUNT))
         .unwrap_or_default();
-    let apps = load_apps();
+    let apps = cached_apps();
 
     let row = GtkBox::builder()
         .orientation(gtk4::Orientation::Horizontal)
@@ -1102,53 +1280,6 @@ fn launch_suggestion(suggbox: &GtkBox, index: usize) -> bool {
     true
 }
 
-fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
-    let q_lower = query.trim().to_lowercase();
-    let q: Vec<char> = q_lower.chars().filter(|c| !c.is_whitespace()).collect();
-    if q.is_empty() {
-        return Some(0);
-    }
-    let t: Vec<char> = text.to_lowercase().chars().collect();
-
-    let mut score = 0_i32;
-    let mut ti = 0_usize;
-    let mut prev: Option<usize> = None;
-
-    for &qc in &q {
-        let mut found = None;
-        while ti < t.len() {
-            if t[ti] == qc {
-                found = Some(ti);
-                ti += 1;
-                break;
-            }
-            ti += 1;
-        }
-        let pos = found?;
-
-        score += 10;
-        match prev {
-            Some(p) if pos == p + 1 => score += 15,
-            Some(p) => score -= (pos - p - 1).min(10) as i32,
-            None => score -= pos.min(10) as i32,
-        }
-        if pos == 0 || !t[pos - 1].is_alphanumeric() {
-            score += 12;
-        }
-        prev = Some(pos);
-    }
-
-    let haystack: String = t.iter().collect();
-    if haystack.contains(&q_lower) {
-        score += 40;
-        if haystack.starts_with(&q_lower) {
-            score += 30;
-        }
-    }
-    score -= t.len() as i32 / 8;
-    Some(score)
-}
-
 fn result_cells(suggbox: &GtkBox) -> Vec<gtk4::Widget> {
     let mut cells = Vec::new();
     if let Some(row) = suggbox.first_child() {
@@ -1183,33 +1314,28 @@ fn move_selection(suggbox: &GtkBox, delta: i32) {
 }
 
 fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
-    while let Some(child) = suggbox.first_child() {
-        suggbox.remove(&child);
+    clear_box(suggbox);
+
+    let index = app_index();
+    let m = Matcher::new(query);
+
+    let mut scored: Vec<(i32, usize)> = Vec::new();
+    for (i, e) in index.iter().enumerate() {
+        let by_name = m.score(&e.name_lc);
+        let by_id = m.score(&e.id_lc);
+        let s = match (by_name, by_id) {
+            (Some(x), Some(y)) => x.max(y - 20),
+            (Some(x), None) => x,
+            (None, Some(y)) => y - 20,
+            (None, None) => continue,
+        };
+        scored.push((s, i));
     }
 
-    let mut scored: Vec<(i32, AppInfo)> = load_apps()
-        .into_iter()
-        .filter_map(|a| {
-            let by_name = fuzzy_score(query, &a.display_name());
-            let by_id = a
-                .id()
-                .and_then(|id| fuzzy_score(query, id.as_str().trim_end_matches(".desktop")));
-            let s = match (by_name, by_id) {
-                (Some(x), Some(y)) => x.max(y - 20),
-                (Some(x), None) => x,
-                (None, Some(y)) => y - 20,
-                (None, None) => return None,
-            };
-            Some((s, a))
-        })
-        .collect();
-
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0).then_with(|| {
-            a.1.display_name()
-                .to_lowercase()
-                .cmp(&b.1.display_name().to_lowercase())
-        })
+    scored.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| index[a.1].sort_key.cmp(&index[b.1].sort_key))
+            .then_with(|| a.1.cmp(&b.1))
     });
     scored.truncate(SEARCH_RESULTS);
 
@@ -1228,7 +1354,9 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
         .halign(gtk4::Align::Center)
         .build();
 
-    for (i, (_, info)) in scored.into_iter().enumerate() {
+    for (i, (_, ix)) in scored.into_iter().enumerate() {
+        let entry = &index[ix];
+        let info = entry.info.clone();
         let cell = GtkBox::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(0)
@@ -1236,13 +1364,13 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
             .hexpand(false)
             .build();
 
-        let button = make_app_button(info.clone(), window);
+        let button = make_app_button(info, window);
         if i == 0 {
             cell.add_css_class("sugg-top");
         }
         cell.append(&button);
 
-        let name = Label::new(Some(&info.display_name()));
+        let name = Label::new(Some(&entry.name));
         name.add_css_class("sugg-name");
         name.set_margin_end(25);
         name.set_halign(gtk4::Align::Center);
@@ -1255,12 +1383,6 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
 
 
 // ───────────────────── mode panel: Files / Web / Calc / Clipboard / Pills ─────────────────────
-
-fn relevant(query: &str, text: &str) -> Option<i32> {
-    let qn = query.chars().filter(|c| !c.is_whitespace()).count() as i32;
-    let s = fuzzy_score(query, text)?;
-    if s >= 14 * qn { Some(s) } else { None }
-}
 
 fn url_encode(s: &str) -> String {
     s.bytes()
@@ -1640,10 +1762,130 @@ fn calc(q: &str) -> Option<String> {
     Some(fmt_x(v))
 }
 
-fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
+struct FileEnt {
+    name_lc: Box<[char]>,
+    path: PathBuf,
+}
+
+struct FileIndex {
+    ents: Vec<FileEnt>,
+    built: Instant,
+}
+
+static FILE_INDEX: RwLock<Option<Arc<FileIndex>>> = RwLock::new(None);
+static FILE_INDEX_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn lower_priority() {
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+fn build_file_index() -> FileIndex {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
     queue.push_back((home, 0));
+    let mut ents: Vec<FileEnt> = Vec::new();
+    let mut visited = 0_usize;
+
+    'walk: while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            visited += 1;
+            if visited > FILE_SCAN_LIMIT {
+                break 'walk;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            let path = e.path();
+            if ft.is_dir() && depth < FILE_DEPTH && !FILE_SKIP_DIRS.contains(&&*name) {
+                queue.push_back((path.clone(), depth + 1));
+            }
+            ents.push(FileEnt {
+                name_lc: lower_chars(&name).into_boxed_slice(),
+                path,
+            });
+        }
+    }
+    FileIndex { ents, built: Instant::now() }
+}
+
+fn refresh_file_index(force: bool) {
+    if !FILES_ENABLED {
+        return;
+    }
+    if FILE_INDEX_BUSY.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let fresh = !force
+        && FILE_INDEX
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| i.built.elapsed() < FILE_INDEX_TTL))
+            .unwrap_or(false);
+    if fresh {
+        FILE_INDEX_BUSY.store(false, Ordering::SeqCst);
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("altdot-file-index".to_string())
+        .spawn(|| {
+            lower_priority();
+            let idx = Arc::new(build_file_index());
+            if let Ok(mut g) = FILE_INDEX.write() {
+                *g = Some(idx);
+            }
+            FILE_INDEX_BUSY.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        FILE_INDEX_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
+    if !FILES_ENABLED {
+        return Vec::new();
+    }
+    let idx = FILE_INDEX.read().ok().and_then(|g| (*g).clone());
+    let Some(idx) = idx else {
+        refresh_file_index(true);
+        return walk_search_files(q, generation, mine);
+    };
+
+    let m = Matcher::new(q);
+    let mut best: Vec<(i32, &FileEnt)> = Vec::new();
+    for (i, e) in idx.ents.iter().enumerate() {
+        if i & 0x1fff == 0 && generation.load(Ordering::Relaxed) != mine {
+            return Vec::new();
+        }
+        if let Some(s) = m.relevant(&e.name_lc) {
+            best.push((s, e));
+            if best.len() > 400 {
+                best.sort_by(|a, b| b.0.cmp(&a.0));
+                best.truncate(PAGE_MAX * 4);
+            }
+        }
+    }
+    best.sort_by(|a, b| b.0.cmp(&a.0));
+    best.truncate(PAGE_MAX);
+    best.into_iter().map(|(_, e)| e.path.clone()).collect()
+}
+
+fn walk_search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((home, 0));
+    let m = Matcher::new(q);
+    let mut buf: Vec<char> = Vec::new();
     let mut best: Vec<(i32, PathBuf)> = Vec::new();
     let mut visited = 0_usize;
 
@@ -1656,6 +1898,9 @@ fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
         };
         for e in rd.flatten() {
             visited += 1;
+            if visited % 128 == 0 && generation.load(Ordering::Relaxed) != mine {
+                return Vec::new();
+            }
             if visited > FILE_SCAN_LIMIT {
                 break 'walk;
             }
@@ -1669,7 +1914,8 @@ fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
             if ft.is_dir() && depth < FILE_DEPTH && !FILE_SKIP_DIRS.contains(&name.as_str()) {
                 queue.push_back((e.path(), depth + 1));
             }
-            if let Some(s) = relevant(q, &name) {
+            lower_into(&mut buf, &name);
+            if let Some(s) = m.relevant(&buf) {
                 best.push((s, e.path()));
             }
         }
@@ -1685,12 +1931,19 @@ fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
 }
 
 fn custom_icon(file: &str, fallback: &str) -> String {
-    let p = Path::new(CUSTOM_ICON_DIR).join(file);
-    if p.is_file() {
-        p.to_string_lossy().to_string()
-    } else {
-        fallback.to_string()
-    }
+    ICON_CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(file.to_string())
+            .or_insert_with(|| {
+                let p = Path::new(CUSTOM_ICON_DIR).join(file);
+                if p.is_file() {
+                    p.to_string_lossy().to_string()
+                } else {
+                    fallback.to_string()
+                }
+            })
+            .clone()
+    })
 }
 
 #[derive(Clone)]
@@ -1790,7 +2043,7 @@ fn web_hits(q: &str) -> Vec<Hit> {
 struct WebResult {
     title: String,
     url: String,
-    thumb: Option<Vec<u8>>,
+    thumb: Option<ThumbPixels>,
 }
 
 fn fetch_thumb(url: &str) -> Option<Vec<u8>> {
@@ -1821,10 +2074,13 @@ fn read_api_key() -> Option<String> {
     }
 }
 
-fn search_web(q: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
-    let Some(key) = read_api_key() else {
+fn search_web(q: &str, key: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
+    if !WEB_API_ENABLED {
         return Vec::new();
-    };
+    }
+    if key.trim().is_empty() {
+        return Vec::new();
+    }
 
     std::thread::sleep(Duration::from_millis(250));
     if generation.load(Ordering::SeqCst) != mine {
@@ -1834,7 +2090,7 @@ fn search_web(q: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
     let Ok(resp) = ureq::get("https://api.search.brave.com/res/v1/web/search")
         .query("q", q)
         .query("count", &PAGE_MAX.to_string())
-        .set("X-Subscription-Token", &key)
+        .set("X-Subscription-Token", key)
         .set("Accept", "application/json")
         .timeout(Duration::from_secs(5))
         .call()
@@ -1865,10 +2121,10 @@ fn search_web(q: &str, generation: &AtomicU64, mine: u64) -> Vec<WebResult> {
         return Vec::new();
     }
 
-    let thumbs: Vec<Option<Vec<u8>>> = std::thread::scope(|s| {
+    let thumbs: Vec<Option<ThumbPixels>> = std::thread::scope(|s| {
         let handles: Vec<_> = items
             .iter()
-            .map(|(_, _, t)| s.spawn(move || t.as_deref().and_then(fetch_thumb)))
+            .map(|(_, _, t)| s.spawn(move || t.as_deref().and_then(fetch_thumb).and_then(thumb_pixels)))
             .collect();
         handles.into_iter().map(|h| h.join().ok().flatten()).collect()
     });
@@ -1896,11 +2152,6 @@ fn thumb_pixbuf(bytes: Vec<u8>) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
     Some(scaled.new_subpixbuf((sw - TW) / 2, (sh - TH) / 2, TW, TH))
 }
 
-fn thumb_texture(bytes: Vec<u8>) -> Option<gtk4::gdk::Texture> {
-    let pb = thumb_pixbuf(bytes)?;
-    Some(gtk4::gdk::Texture::for_pixbuf(&pb))
-}
-
 #[derive(Clone)]
 struct ThumbPixels {
     data: Vec<u8>,
@@ -1911,20 +2162,15 @@ struct ThumbPixels {
 }
 
 impl ThumbPixels {
-    fn texture(&self) -> gtk4::gdk::Texture {
+    fn into_texture(self) -> gtk4::gdk::Texture {
         let fmt = if self.alpha {
             gtk4::gdk::MemoryFormat::R8g8b8a8
         } else {
             gtk4::gdk::MemoryFormat::R8g8b8
         };
-        gtk4::gdk::MemoryTexture::new(
-            self.w,
-            self.h,
-            fmt,
-            &glib::Bytes::from(&self.data[..]),
-            self.stride,
-        )
-        .upcast::<gtk4::gdk::Texture>()
+        let (w, h, stride) = (self.w, self.h, self.stride);
+        gtk4::gdk::MemoryTexture::new(w, h, fmt, &glib::Bytes::from_owned(self.data), stride)
+            .upcast::<gtk4::gdk::Texture>()
     }
 }
 
@@ -1943,7 +2189,7 @@ fn web_result_hits(q: &str, found: Vec<WebResult>) -> Vec<Hit> {
     let mut hits = web_hits(q);
     hits.extend(found.into_iter().map(|r| {
         let host = r.url.split('/').nth(2).unwrap_or("").to_string();
-        let thumb = r.thumb.and_then(thumb_texture);
+        let thumb = r.thumb.map(|t| t.into_texture());
         let url = r.url;
         Hit {
             title: r.title,
@@ -1981,17 +2227,47 @@ enum ClipKind {
     Clear,
 }
 
+#[derive(Clone)]
+enum ThumbJob {
+    Clip(u64),
+    File(PathBuf),
+}
+
 struct ClipItem {
     line: String,
     kind: ClipKind,
     title: String,
     subtitle: String,
     thumb: Option<ThumbPixels>,
+    job: Option<ThumbJob>,
+}
+
+enum ClipMsg {
+    Items(Result<Vec<ClipItem>, String>),
+    Thumbs(Vec<(String, ThumbPixels)>),
+}
+
+struct ClipEntry {
+    id: u64,
+    prev: String,
+    line: String,
+    hay: String,
+}
+
+static CLIP_LIST_CACHE: Mutex<Option<(Instant, Arc<Vec<ClipEntry>>)>> = Mutex::new(None);
+
+fn clip_cache_clear() {
+    if let Ok(mut g) = CLIP_LIST_CACHE.lock() {
+        *g = None;
+    }
 }
 
 static CLIP_THUMBS: std::sync::OnceLock<Mutex<HashMap<u64, ThumbPixels>>> = std::sync::OnceLock::new();
 
 fn ensure_cliphist_watchers() {
+    if !CLIP_ENABLED {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         if !(in_path("cliphist") && in_path("wl-paste")) {
@@ -2015,7 +2291,7 @@ fn ensure_cliphist_watchers() {
     });
 }
 
-fn cliphist_list() -> std::io::Result<Vec<(u64, String, String)>> {
+fn cliphist_list() -> std::io::Result<Vec<ClipEntry>> {
     let out = Command::new("cliphist")
         .args(["-preview-width", CLIP_PREVIEW_WIDTH, "list"])
         .output()?;
@@ -2029,9 +2305,33 @@ fn cliphist_list() -> std::io::Result<Vec<(u64, String, String)>> {
         .lines()
         .filter_map(|l| {
             let (id, prev) = l.split_once('\t')?;
-            Some((id.trim().parse().ok()?, prev.to_string(), l.to_string()))
+            let id: u64 = id.trim().parse().ok()?;
+            let hay = (if parse_binary_preview(prev).is_some() {
+                format!("image img picture screenshot {prev}")
+            } else if looks_like_files(prev) {
+                format!("file files {}", percent_decode(prev))
+            } else {
+                prev.to_string()
+            })
+            .to_lowercase();
+            Some(ClipEntry { id, prev: prev.to_string(), line: l.to_string(), hay })
         })
         .collect())
+}
+
+fn cliphist_list_cached() -> std::io::Result<Arc<Vec<ClipEntry>>> {
+    if let Ok(g) = CLIP_LIST_CACHE.lock() {
+        if let Some((at, list)) = g.as_ref() {
+            if at.elapsed() < CLIP_LIST_TTL {
+                return Ok(list.clone());
+            }
+        }
+    }
+    let list = Arc::new(cliphist_list()?);
+    if let Ok(mut g) = CLIP_LIST_CACHE.lock() {
+        *g = Some((Instant::now(), list.clone()));
+    }
+    Ok(list)
 }
 
 fn cliphist_decode(line: &str) -> Option<Vec<u8>> {
@@ -2091,18 +2391,21 @@ fn is_image_path(p: &Path) -> bool {
     )
 }
 
-fn clip_thumb(id: u64, line: &str) -> Option<ThumbPixels> {
+fn clip_thumb_cached(id: u64) -> Option<ThumbPixels> {
     let cache = CLIP_THUMBS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(c) = cache.lock() {
-        if let Some(t) = c.get(&id) {
-            return Some(t.clone());
-        }
+    cache.lock().ok()?.get(&id).cloned()
+}
+
+fn clip_thumb(id: u64, line: &str) -> Option<ThumbPixels> {
+    if let Some(t) = clip_thumb_cached(id) {
+        return Some(t);
     }
     let bytes = cliphist_decode(line)?;
     if bytes.len() > CLIP_IMG_MAX_BYTES {
         return None;
     }
     let t = thumb_pixels(bytes)?;
+    let cache = CLIP_THUMBS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut c) = cache.lock() {
         if c.len() >= CLIP_THUMB_CACHE {
             c.clear();
@@ -2110,6 +2413,19 @@ fn clip_thumb(id: u64, line: &str) -> Option<ThumbPixels> {
         c.insert(id, t.clone());
     }
     Some(t)
+}
+
+fn run_thumb_job(job: &ThumbJob, line: &str) -> Option<ThumbPixels> {
+    match job {
+        ThumbJob::Clip(id) => clip_thumb(*id, line),
+        ThumbJob::File(p) => {
+            let meta = std::fs::metadata(p).ok()?;
+            if meta.len() as usize > CLIP_IMG_MAX_BYTES {
+                return None;
+            }
+            thumb_pixels(std::fs::read(p).ok()?)
+        }
+    }
 }
 
 fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
@@ -2123,8 +2439,11 @@ fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
         } else {
             ("Image".to_string(), format!("{info} · Enter to select · Del to delete"))
         };
-        let thumb = clip_thumb(id, &line);
-        return ClipItem { line, kind: ClipKind::Image, title, subtitle, thumb };
+        let (thumb, job) = match clip_thumb_cached(id) {
+            Some(t) => (Some(t), None),
+            None => (None, Some(ThumbJob::Clip(id))),
+        };
+        return ClipItem { line, kind: ClipKind::Image, title, subtitle, thumb, job };
     }
 
     if looks_like_files(prev) {
@@ -2142,16 +2461,9 @@ fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
                     format!("{} files · {}", paths.len(), pretty_dir(first)),
                 )
             };
-            let thumb = (paths.len() == 1 && is_image_path(first))
-                .then(|| {
-                    let meta = std::fs::metadata(first).ok()?;
-                    if meta.len() as usize > CLIP_IMG_MAX_BYTES {
-                        return None;
-                    }
-                    thumb_pixels(std::fs::read(first).ok()?)
-                })
-                .flatten();
-            return ClipItem { line, kind: ClipKind::Files, title, subtitle, thumb };
+            let job = (paths.len() == 1 && is_image_path(first))
+                .then(|| ThumbJob::File(first.clone()));
+            return ClipItem { line, kind: ClipKind::Files, title, subtitle, thumb: None, job };
         }
     }
 
@@ -2161,6 +2473,7 @@ fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
         title: prev.trim().to_string(),
         subtitle: "Clipboard · Enter to select · Del to delete".to_string(),
         thumb: None,
+        job: None,
     }
 }
 
@@ -2171,6 +2484,7 @@ fn clear_clip() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+        clip_cache_clear();
         if let Some(cache) = CLIP_THUMBS.get() {
             if let Ok(mut c) = cache.lock() {
                 c.clear();
@@ -2206,9 +2520,13 @@ fn cliphist_delete(line: &str) {
         let _ = si.write_all(line.as_bytes());
     }
     let _ = child.wait();
+    clip_cache_clear();
 }
 
 fn search_clip(q: &str, generation: &AtomicU64, mine: u64) -> Result<Vec<ClipItem>, String> {
+    if !CLIP_ENABLED {
+        return Ok(Vec::new());
+    }
     let list_all = is_clip_query(q);
     let mut words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
     if list_all {
@@ -2219,7 +2537,7 @@ fn search_clip(q: &str, generation: &AtomicU64, mine: u64) -> Result<Vec<ClipIte
     }
     let limit = if list_all { CLIP_ALL_MAX } else { PAGE_MAX };
 
-    let entries = match cliphist_list() {
+    let entries = match cliphist_list_cached() {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             static WARN: std::sync::Once = std::sync::Once::new();
@@ -2239,29 +2557,23 @@ fn search_clip(q: &str, generation: &AtomicU64, mine: u64) -> Result<Vec<ClipIte
             title: "Clear clipboard history".to_string(),
             subtitle: format!("Enter to delete all {} entries", entries.len()),
             thumb: None,
+            job: None,
         }]);
     }
 
     let mut items = Vec::new();
-    for (id, prev, line) in entries {
+    for (n, e) in entries.iter().enumerate() {
         if items.len() >= limit {
             break;
         }
-        if generation.load(Ordering::SeqCst) != mine {
+        if n % 64 == 0 && generation.load(Ordering::SeqCst) != mine {
             return Ok(Vec::new());
         }
-
-        let hay = if parse_binary_preview(&prev).is_some() {
-            format!("image img picture screenshot {prev}")
-        } else if looks_like_files(&prev) {
-            format!("file files {}", percent_decode(&prev))
-        } else {
-            prev.clone()
-        }
-        .to_lowercase();
-
-        if words.iter().all(|w| hay.contains(w.as_str())) {
-            items.push(build_clip_item(id, &prev, line));
+        if words.iter().all(|w| e.hay.contains(w.as_str())) {
+            items.push(build_clip_item(e.id, &e.prev, e.line.clone()));
+            if generation.load(Ordering::SeqCst) != mine {
+                return Ok(Vec::new());
+            }
         }
     }
     Ok(items)
@@ -2342,7 +2654,7 @@ fn clip_hits(res: Result<Vec<ClipItem>, String>) -> Vec<Hit> {
                         ClipKind::Files => "text-x-generic".to_string(),
                         ClipKind::Clear => "edit-delete".to_string(),
                     },
-                    thumb: it.thumb.map(|t| t.texture()),
+                    thumb: it.thumb.map(|t| t.into_texture()),
                     clip_line: if clear { None } else { Some(line) },
                     action,
                 }
@@ -2352,10 +2664,11 @@ fn clip_hits(res: Result<Vec<ClipItem>, String>) -> Vec<Hit> {
 }
 
 fn pill_hits(q: &str) -> Vec<Hit> {
+    let m = Matcher::new(q);
     let mut v: Vec<(i32, Hit)> = PILLS
         .iter()
         .filter_map(|(name, icon, cmd)| {
-            let s = relevant(q, name)?;
+            let s = m.relevant(&lower_chars(name))?;
             let cmd = cmd.to_string();
             Some((
                 s,
@@ -2378,16 +2691,31 @@ fn pill_hits(q: &str) -> Vec<Hit> {
     v.into_iter().map(|(_, h)| h).collect()
 }
 
+fn thumb_picture(tex: &gtk4::gdk::Texture) -> Picture {
+    let pic = Picture::for_paintable(tex);
+    pic.set_can_shrink(true);
+    pic.set_size_request(64, 44);
+    pic.set_valign(gtk4::Align::Center);
+    pic.add_css_class("hit-thumb");
+    pic
+}
+
+fn set_row_thumb(row: &gtk4::Widget, tex: &gtk4::gdk::Texture) {
+    let Some(btn) = row.downcast_ref::<Button>() else {
+        return;
+    };
+    let Some(inner) = btn.child().and_then(|c| c.downcast::<GtkBox>().ok()) else {
+        return;
+    };
+    if let Some(old) = inner.first_child() {
+        inner.remove(&old);
+    }
+    inner.prepend(&thumb_picture(tex));
+}
+
 fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
     let lead: gtk4::Widget = match &hit.thumb {
-        Some(tex) => {
-            let pic = Picture::for_paintable(tex);
-            pic.set_can_shrink(true);
-            pic.set_size_request(64, 44);
-            pic.set_valign(gtk4::Align::Center);
-            pic.add_css_class("hit-thumb");
-            pic.upcast()
-        }
+        Some(tex) => thumb_picture(tex).upcast(),
         None => {
             let icon = if hit.icon.starts_with('/') {
                 let file = gio::File::for_path(&hit.icon);
@@ -2675,7 +3003,13 @@ struct ModePanel {
     hits_scroller: ScrolledWindow,
     sel: Rc<Cell<Option<usize>>>,
     focused: Rc<Cell<bool>>,
+    calc_help: GtkBox,
+    clip_help: GtkBox,
+    dirty: Rc<Cell<u32>>,
 }
+
+const DIRTY_HOME: u32 = 1 << 5;
+const DIRTY_ALL: u32 = 0x3f;
 
 impl ModePanel {
     fn new(window: &ApplicationWindow, host: &GtkBox, _display: &Display, apps_box: &GtkBox) -> Self {
@@ -2753,6 +3087,9 @@ impl ModePanel {
             hits_scroller: scroller,
             sel: Rc::new(Cell::new(None)),
             focused: Rc::new(Cell::new(false)),
+            calc_help: calc_help(),
+            clip_help: clip_help(),
+            dirty: Rc::new(Cell::new(DIRTY_ALL)),
         };
 
         for (id, b) in panel.tabs.clone() {
@@ -2767,7 +3104,7 @@ impl ModePanel {
         self.hits_scroller.vadjustment().set_value(0.0);
         self.focused.set(false);
         self.sel.set(None);
-        self.apply_selection();
+        self.flush();
     }
 
     fn mode_focused(&self) -> bool {
@@ -2899,7 +3236,7 @@ impl ModePanel {
         self.render();
     }
 
-    fn search(&self, q: &str) {
+    fn search_fast(&self, q: &str) {
         let q = q.trim().to_string();
         let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.focused.set(false);
@@ -2921,55 +3258,112 @@ impl ModePanel {
         }
         self.render();
 
-        if q.chars().count() >= FILE_MIN_QUERY {
+        if FILES_ENABLED && q.chars().count() >= FILE_MIN_QUERY {
             let (tx, rx) = async_channel::bounded::<Vec<PathBuf>>(1);
             let generation = self.generation.clone();
             let qq = q.clone();
-            std::thread::spawn(move || {
-                let found = search_files(&qq, &generation, mine);
-                let _ = tx.send_blocking(found);
-            });
+            let _ = std::thread::Builder::new()
+                .name("altdot-file-search".to_string())
+                .spawn(move || {
+                    let found = search_files(&qq, &generation, mine);
+                    let _ = tx.send_blocking(found);
+                });
 
             let panel = self.clone();
             glib::spawn_future_local(async move {
                 if let Ok(paths) = rx.recv().await {
                     if panel.generation.load(Ordering::SeqCst) == mine {
-                        panel.results.borrow_mut()[Cat::Files.idx()] = file_hits(paths, &panel.window);
-                        panel.render();
-                    }
-                }
-            });
-        }
-
-        if !q.is_empty() {
-            let (tx, rx) = async_channel::bounded::<Result<Vec<ClipItem>, String>>(1);
-            let generation = self.generation.clone();
-            let qq = q.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send_blocking(search_clip(&qq, &generation, mine));
-            });
-
-            let panel = self.clone();
-            glib::spawn_future_local(async move {
-                if let Ok(res) = rx.recv().await {
-                    if panel.generation.load(Ordering::SeqCst) == mine {
-                        let hits = clip_hits(res);
-                        if !hits.is_empty() {
-                            panel.results.borrow_mut()[Cat::Clip.idx()] = hits;
-                            panel.render();
+                        let hits = file_hits(paths, &panel.window);
+                        let unchanged = hits.is_empty()
+                            && panel.results.borrow()[Cat::Files.idx()].is_empty();
+                        if !unchanged {
+                            panel.results.borrow_mut()[Cat::Files.idx()] = hits;
+                            panel.render_cats(&[Cat::Files]);
                         }
                     }
                 }
             });
         }
+    }
 
-        if !q.is_empty() {
+    fn search_slow(&self, q: &str) {
+        let q = q.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let mine = self.generation.load(Ordering::SeqCst);
+
+        if CLIP_ENABLED {
+            let (tx, rx) = async_channel::unbounded::<ClipMsg>();
+            let generation = self.generation.clone();
+            let qq = q.clone();
+            let _ = std::thread::Builder::new()
+                .name("altdot-clipboard-search".to_string())
+                .spawn(move || {
+                    let result = search_clip(&qq, &generation, mine);
+                    let jobs: Vec<(String, ThumbJob)> = match &result {
+                        Ok(items) => items
+                            .iter()
+                            .filter_map(|it| it.job.clone().map(|j| (it.line.clone(), j)))
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    if tx.send_blocking(ClipMsg::Items(result)).is_err() {
+                        return;
+                    }
+
+                    let mut batch: Vec<(String, ThumbPixels)> = Vec::new();
+                    let mut last = Instant::now();
+                    for (line, job) in jobs {
+                        if generation.load(Ordering::SeqCst) != mine {
+                            return;
+                        }
+                        if let Some(t) = run_thumb_job(&job, &line) {
+                            batch.push((line, t));
+                        }
+                        if !batch.is_empty() && last.elapsed() >= Duration::from_millis(200) {
+                            if tx.send_blocking(ClipMsg::Thumbs(std::mem::take(&mut batch))).is_err() {
+                                return;
+                            }
+                            last = Instant::now();
+                        }
+                    }
+                    if !batch.is_empty() {
+                        let _ = tx.send_blocking(ClipMsg::Thumbs(batch));
+                    }
+                });
+
+            let panel = self.clone();
+            glib::spawn_future_local(async move {
+                while let Ok(msg) = rx.recv().await {
+                    if panel.generation.load(Ordering::SeqCst) != mine {
+                        break;
+                    }
+                    match msg {
+                        ClipMsg::Items(res) => {
+                            let hits = clip_hits(res);
+                            if !hits.is_empty() {
+                                panel.results.borrow_mut()[Cat::Clip.idx()] = hits;
+                                panel.render_cats(&[Cat::Clip]);
+                            }
+                        }
+                        ClipMsg::Thumbs(batch) => panel.apply_thumbs(batch),
+                    }
+                }
+            });
+        }
+
+        let brave_key = if WEB_API_ENABLED { read_api_key() } else { None };
+        if let Some(key) = brave_key.filter(|key| !key.trim().is_empty()) {
             let (tx, rx) = async_channel::bounded::<Vec<WebResult>>(1);
             let generation = self.generation.clone();
             let qq = q.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send_blocking(search_web(&qq, &generation, mine));
-            });
+            let _ = std::thread::Builder::new()
+                .name("altdot-web-search".to_string())
+                .spawn(move || {
+                    let found = search_web(&qq, &key, &generation, mine);
+                    let _ = tx.send_blocking(found);
+                });
 
             let panel = self.clone();
             let qq = q.clone();
@@ -2977,40 +3371,75 @@ impl ModePanel {
                 if let Ok(found) = rx.recv().await {
                     if panel.generation.load(Ordering::SeqCst) == mine && !found.is_empty() {
                         panel.results.borrow_mut()[Cat::Web.idx()] = web_result_hits(&qq, found);
-                        panel.render();
+                        panel.render_cats(&[Cat::Web]);
                     }
                 }
             });
         }
     }
 
-    fn render(&self) {
-        let res = self.results.borrow();
-        clear_box(&self.home);
-
-        for c in Cat::ALL {
-            let hits = &res[c.idx()];
-            let page = &self.pages[c.idx()];
-            clear_box(page);
-
-            if hits.is_empty() {
-                if c == Cat::Calc {
-                    page.append(&calc_help());
-                } else if c == Cat::Clip {
-                    page.append(&clip_help());
-                } else {
-                    let none = Label::new(Some("Nothing found"));
-                    none.add_css_class("sugg-empty-sub");
-                    none.set_halign(gtk4::Align::Start);
-                    page.append(&none);
-                }
-            } else {
-                for h in hits.iter().take(page_limit(c)) {
-                    page.append(&hit_button(h, &self.window));
-                }
+    fn apply_thumbs(&self, batch: Vec<(String, ThumbPixels)>) {
+        let idx = Cat::Clip.idx();
+        let built = self.dirty.get() & (1u32 << idx) == 0;
+        let mut rows: Vec<gtk4::Widget> = Vec::new();
+        if built {
+            let mut c = self.pages[idx].first_child();
+            while let Some(w) = c {
+                c = w.next_sibling();
+                rows.push(w);
             }
         }
 
+        {
+            let mut res = self.results.borrow_mut();
+            let hits = &mut res[idx];
+            for (line, t) in batch {
+                let tex = t.into_texture();
+                for (i, h) in hits.iter_mut().enumerate() {
+                    if h.clip_line.as_deref() == Some(line.as_str()) {
+                        h.thumb = Some(tex.clone());
+                        if let Some(row) = rows.get(i) {
+                            set_row_thumb(row, &tex);
+                        }
+                    }
+                }
+            }
+        }
+        self.mark_dirty(DIRTY_HOME);
+        self.flush();
+    }
+
+    fn mark_dirty(&self, bits: u32) {
+        self.dirty.set(self.dirty.get() | bits);
+    }
+
+    fn build_page(&self, c: Cat) {
+        let res = self.results.borrow();
+        let hits = &res[c.idx()];
+        let page = &self.pages[c.idx()];
+        clear_box(page);
+
+        if hits.is_empty() {
+            if c == Cat::Calc {
+                page.append(&self.calc_help);
+            } else if c == Cat::Clip {
+                page.append(&self.clip_help);
+            } else {
+                let none = Label::new(Some("Nothing found"));
+                none.add_css_class("sugg-empty-sub");
+                none.set_halign(gtk4::Align::Start);
+                page.append(&none);
+            }
+        } else {
+            for h in hits.iter().take(page_limit(c)) {
+                page.append(&hit_button(h, &self.window));
+            }
+        }
+    }
+
+    fn build_home(&self) {
+        let res = self.results.borrow();
+        clear_box(&self.home);
         for c in Cat::HOME {
             if let Some(top) = res[c.idx()].first() {
                 let head = Label::new(Some(c.title()));
@@ -3020,7 +3449,42 @@ impl ModePanel {
                 self.home.append(&hit_button(top, &self.window));
             }
         }
+    }
+
+    fn flush(&self) {
+        let name = self
+            .stack
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let mut d = self.dirty.get();
+        if name.is_empty() || name == "home" {
+            if d & DIRTY_HOME != 0 {
+                self.build_home();
+                d &= !DIRTY_HOME;
+            }
+        } else if let Some(c) = Cat::ALL.iter().copied().find(|c| c.id() == name) {
+            let bit = 1u32 << c.idx();
+            if d & bit != 0 {
+                self.build_page(c);
+                d &= !bit;
+            }
+        }
+        self.dirty.set(d);
         self.apply_selection();
+    }
+
+    fn render_cats(&self, cats: &[Cat]) {
+        for c in cats {
+            self.mark_dirty(1u32 << c.idx());
+        }
+        self.mark_dirty(DIRTY_HOME);
+        self.flush();
+    }
+
+    fn render(&self) {
+        self.mark_dirty(DIRTY_ALL);
+        self.flush();
     }
 
     fn delete_current(&self) -> bool {
@@ -3108,8 +3572,8 @@ fn populate(grid: &FlowBox, window: &ApplicationWindow) {
         grid.remove(&child);
     }
 
-    for info in load_apps() {
-        grid.insert(&make_app_button(info, window), -1);
+    for info in cached_apps().iter() {
+        grid.insert(&make_app_button(info.clone(), window), -1);
     }
 }
 
@@ -3132,6 +3596,7 @@ fn animate_on_map(win: &ApplicationWindow, target: &gtk4::Box) {
 fn build_window(
     app: &Application,
     usage: &UsageMap,
+    _apps: Rc<Vec<AppInfo>>,
 ) -> (ApplicationWindow, ApplicationWindow, FlowBox, GtkBox, SearchUi) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -3396,17 +3861,46 @@ fn build_window(
         let sg = suggestionbox.clone();
         let w = window.clone();
         let u = usage.clone();
+        let query_generation = Rc::new(Cell::new(0_u64));
         search.entry.connect_changed(move |e| {
             if !ui.active() {
                 return;
             }
             let q = e.text().to_string();
+            let generation = query_generation.get().wrapping_add(1);
+            query_generation.set(generation);
+
             if q.trim().is_empty() {
+                ui.panel.generation.fetch_add(1, Ordering::SeqCst);
                 ui.exit();
                 refresh_suggestions(&sg, &w, &u);
-            } else {
-                show_results(&sg, &w, &q);
-                ui.panel.search(&q);
+                return;
+            }
+
+            {
+                let ui = ui.clone();
+                let sg = sg.clone();
+                let qg = query_generation.clone();
+                let w = w.clone();
+                let q = q.clone();
+                glib::timeout_add_local_once(Duration::from_millis(FAST_DEBOUNCE_MS), move || {
+                    if qg.get() != generation || !ui.active() {
+                        return;
+                    }
+                    show_results(&sg, &w, &q);
+                });
+            }
+
+            {
+                let ui = ui.clone();
+                let qg = query_generation.clone();
+                glib::timeout_add_local_once(Duration::from_millis(MODE_DEBOUNCE_MS), move || {
+                    if qg.get() != generation || !ui.active() {
+                        return;
+                    }
+                    ui.panel.search_fast(&q);
+                    ui.panel.search_slow(&q);
+                });
             }
         });
 
@@ -3833,10 +4327,17 @@ fn main() -> glib::ExitCode {
         std::mem::forget(app.hold());
         let apps = load_apps();
         let resolver = build_resolver(&apps);
+        let apps = Rc::new(apps);
+        seed_app_cache(apps.clone());
+        watch_app_changes();
+        refresh_file_index(true);
+        glib::idle_add_local_once(|| {
+            let _ = app_index();
+        });
         let usage: UsageMap = Arc::new(Mutex::new(load_usage()));
         spawn_tracker(resolver, usage.clone());
 
-        let (window, bd, grid, suggestionbox, search) = build_window(app, &usage);
+        let (window, bd, grid, suggestionbox, search) = build_window(app, &usage, apps.clone());
 
         let last_slot = Rc::new(Cell::new(current_slot()));
         {
@@ -3869,7 +4370,11 @@ fn main() -> glib::ExitCode {
                 } else {
                     reset_launch(&window);
                     search.exit();
-                    populate(&grid, &window);
+                    if take_grid_stale() {
+                        populate(&grid, &window);
+                    }
+                    clip_cache_clear();
+                    refresh_file_index(false);
                     refresh_suggestions(&suggestionbox, &window, &usage);
                     bd.present();
                     window.present();
@@ -3886,27 +4391,27 @@ fn main() -> glib::ExitCode {
                 toggle_for_keys();
             }
         });
-        install_signal_handlers();
         {
             let t = toggle.clone();
             let window = window.clone();
             let search = search.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                if SIG_TOGGLE.swap(false, Ordering::SeqCst) {
-                    t();
-                }
-                if SIG_SEARCH.swap(false, Ordering::SeqCst) {
-                    if !window.is_visible() {
+            let rx = spawn_signal_listener();
+            glib::spawn_future_local(async move {
+                while let Ok(sig) = rx.recv().await {
+                    if sig == libc::SIGUSR1 {
                         t();
-                    }
-                    if let Some(q) = take_search_request() {
-                        search.enter();
-                        search.entry.grab_focus();
-                        search.entry.set_text(&q);
-                        search.entry.set_position(-1);
+                    } else if sig == libc::SIGUSR2 {
+                        if !window.is_visible() {
+                            t();
+                        }
+                        if let Some(q) = take_search_request() {
+                            search.enter();
+                            search.entry.grab_focus();
+                            search.entry.set_text(&q);
+                            search.entry.set_position(-1);
+                        }
                     }
                 }
-                glib::ControlFlow::Continue
             });
         }
 
