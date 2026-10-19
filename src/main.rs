@@ -12,7 +12,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -518,12 +519,18 @@ struct SuperState {
     clean: AtomicBool,
 }
 
-fn spawn_super_watchers(tx: Sender<()>) {
+fn watch_input_device(
+    path: PathBuf,
+    mut dev: evdev::Device,
+    is_keyboard: bool,
+    tx: Sender<()>,
+    st: Arc<SuperState>,
+    watched: Arc<Mutex<HashSet<PathBuf>>>,
+) {
     use evdev::{EventType, KeyCode, RelativeAxisCode};
 
     let left = KeyCode::KEY_LEFTMETA.code();
     let right = KeyCode::KEY_RIGHTMETA.code();
-
     let touch = KeyCode::BTN_TOUCH.0;
     let finger = KeyCode::BTN_TOOL_FINGER.0;
     let wheel = [
@@ -533,37 +540,18 @@ fn spawn_super_watchers(tx: Sender<()>) {
         RelativeAxisCode::REL_HWHEEL_HI_RES.0,
     ];
 
-    let state = Arc::new(SuperState {
-        down: AtomicBool::new(false),
-        clean: AtomicBool::new(false),
-    });
-
-    for (_path, mut dev) in evdev::enumerate() {
-        let is_keyboard = dev
-            .supported_keys()
-            .map_or(false, |k| k.contains(KeyCode::KEY_LEFTMETA));
-        let is_pointer = !is_keyboard
-            && (dev
-                .supported_keys()
-                .map_or(false, |k| k.contains(KeyCode::BTN_LEFT))
-                || dev
-                    .supported_relative_axes()
-                    .map_or(false, |r| r.contains(RelativeAxisCode::REL_WHEEL)));
-
-        if is_keyboard {
-            let tx = tx.clone();
-            let st = state.clone();
-            std::thread::spawn(move || loop {
-                let events = match dev.fetch_events() {
-                    Ok(e) => e,
-                    Err(_) => break,
-                };
-                for ev in events {
+    std::thread::spawn(move || {
+        loop {
+            let events = match dev.fetch_events() {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+            for ev in events {
+                let (code, value) = (ev.code(), ev.value());
+                if is_keyboard {
                     if ev.event_type() != EventType::KEY {
                         continue;
                     }
-                    let (code, value) = (ev.code(), ev.value());
-
                     if code == left || code == right {
                         match value {
                             1 => {
@@ -571,8 +559,7 @@ fn spawn_super_watchers(tx: Sender<()>) {
                                 st.clean.store(true, Ordering::SeqCst);
                             }
                             0 => {
-                                if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst)
-                                {
+                                if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst) {
                                     let _ = tx.send_blocking(());
                                 }
                                 st.down.store(false, Ordering::SeqCst);
@@ -582,20 +569,10 @@ fn spawn_super_watchers(tx: Sender<()>) {
                     } else if value == 1 && st.down.load(Ordering::SeqCst) {
                         st.clean.store(false, Ordering::SeqCst);
                     }
-                }
-            });
-        } else if is_pointer {
-            let st = state.clone();
-            std::thread::spawn(move || loop {
-                let events = match dev.fetch_events() {
-                    Ok(e) => e,
-                    Err(_) => break,
-                };
-                for ev in events {
+                } else {
                     if !st.down.load(Ordering::SeqCst) {
                         continue;
                     }
-                    let (code, value) = (ev.code(), ev.value());
                     let taints = match ev.event_type() {
                         EventType::KEY => value == 1 && code != touch && code != finger,
                         EventType::RELATIVE => wheel.contains(&code),
@@ -605,9 +582,71 @@ fn spawn_super_watchers(tx: Sender<()>) {
                         st.clean.store(false, Ordering::SeqCst);
                     }
                 }
-            });
+            }
         }
-    }
+        if is_keyboard {
+            st.down.store(false, Ordering::SeqCst);
+            st.clean.store(false, Ordering::SeqCst);
+        }
+        if let Ok(mut w) = watched.lock() {
+            w.remove(&path);
+        }
+    });
+}
+
+fn spawn_super_watchers(tx: Sender<()>) {
+    use evdev::{KeyCode, RelativeAxisCode};
+
+    let state = Arc::new(SuperState {
+        down: AtomicBool::new(false),
+        clean: AtomicBool::new(false),
+    });
+    let watched: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    std::thread::spawn(move || loop {
+        let mut present: HashSet<PathBuf> = HashSet::new();
+        if let Ok(rd) = std::fs::read_dir("/dev/input") {
+            for e in rd.flatten() {
+                let path = e.path();
+                let is_event = path
+                    .file_name()
+                    .map_or(false, |n| n.to_string_lossy().starts_with("event"));
+                if !is_event {
+                    continue;
+                }
+                present.insert(path.clone());
+
+                if watched.lock().map_or(true, |w| w.contains(&path)) {
+                    continue;
+                }
+                let Ok(dev) = evdev::Device::open(&path) else {
+                    continue;
+                };
+
+                let is_keyboard = dev
+                    .supported_keys()
+                    .map_or(false, |k| k.contains(KeyCode::KEY_LEFTMETA));
+                let is_pointer = !is_keyboard
+                    && (dev
+                        .supported_keys()
+                        .map_or(false, |k| k.contains(KeyCode::BTN_LEFT))
+                        || dev
+                            .supported_relative_axes()
+                            .map_or(false, |r| r.contains(RelativeAxisCode::REL_WHEEL)));
+
+                if let Ok(mut w) = watched.lock() {
+                    w.insert(path.clone());
+                }
+                if is_keyboard || is_pointer {
+                    watch_input_device(path, dev, is_keyboard, tx.clone(), state.clone(), watched.clone());
+                }
+            }
+        }
+        if let Ok(mut w) = watched.lock() {
+            w.retain(|p| present.contains(p));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
 }
 
 // ───────────────────────── UI ─────────────────────────
@@ -631,11 +670,44 @@ fn make_app_button(info: AppInfo, window: &ApplicationWindow) -> Button {
 }
 
 fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn()?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+fn user_systemd_available() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        in_path("systemd-run")
+            && std::env::var_os("XDG_RUNTIME_DIR")
+                .map(|d| Path::new(&d).join("systemd/private").exists())
+                .unwrap_or(false)
+    })
+}
+
+fn spawn_survivor(argv: &[String], cwd: Option<PathBuf>) -> std::io::Result<()> {
+    let mut cmd = if user_systemd_available() {
+        let mut c = Command::new("systemd-run");
+        c.args(["--user", "--scope", "--collect", "--quiet", "--"]).args(argv);
+        c
+    } else {
+        let mut c = Command::new(&argv[0]);
+        c.args(&argv[1..]);
+        c
+    };
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    spawn_detached(&mut cmd)
 }
 
 fn in_path(bin: &str) -> bool {
@@ -762,11 +834,19 @@ fn run_app(info: &AppInfo, term: Option<&'static str>, file: Option<&Path>) -> R
                 .find(|(n, _)| *n == t)
                 .map(|(_, f)| *f)
                 .unwrap_or(&[]);
-            let mut cmd = Command::new(t);
-            cmd.args(flags).args(&argv);
-            spawn_detached(&mut cmd).map_err(|e| e.to_string())
+            let mut full: Vec<String> = vec![t.to_string()];
+            full.extend(flags.iter().map(|s| s.to_string()));
+            full.extend(argv);
+            spawn_survivor(&full, None).map_err(|e| e.to_string())
         }
         None => {
+            if let Some(argv) = terminal_app_argv(info, file).filter(|a| !a.is_empty()) {
+                let cwd = desktop_keyfile(info)
+                    .and_then(|kf| kf.string("Desktop Entry", "Path").ok())
+                    .map(|p| PathBuf::from(p.to_string()))
+                    .filter(|p| p.is_dir());
+                return spawn_survivor(&argv, cwd).map_err(|e| e.to_string());
+            }
             let files: Vec<gio::File> = file.map(gio::File::for_path).into_iter().collect();
             info.launch(&files, None::<&gio::AppLaunchContext>)
                 .map_err(|e| e.to_string())
@@ -1188,6 +1268,8 @@ fn refresh_suggestions(suggbox: &GtkBox, window: &ApplicationWindow, usage: &Usa
     while let Some(child) = suggbox.first_child() {
         suggbox.remove(&child);
     }
+
+    suggbox.set_halign(gtk4::Align::Center);
     let ids = current_slot()
         .map(|slot| top_apps(usage, slot, SUGGEST_COUNT))
         .unwrap_or_default();
@@ -1314,6 +1396,7 @@ fn move_selection(suggbox: &GtkBox, delta: i32) {
 
 fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
     clear_box(suggbox);
+    suggbox.set_halign(gtk4::Align::Start);
 
     let index = app_index();
     let m = Matcher::new(query);
@@ -1359,7 +1442,7 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
         let cell = GtkBox::builder()
             .orientation(gtk4::Orientation::Horizontal)
             .spacing(0)
-            .halign(gtk4::Align::Center)
+            .halign(gtk4::Align::Start)
             .hexpand(false)
             .build();
 
@@ -3463,6 +3546,13 @@ fn build_window(
     bd.set_child(Some(&bd_fill));
     animate_on_map(&bd, &bd_fill);
 
+    let bd_click = gtk4::GestureClick::new();
+    {
+        let win = window.clone();
+        bd_click.connect_pressed(move |_, _, _, _| win.set_visible(false));
+    }
+    bd.add_controller(bd_click);
+
     let bd_for_hide = bd.clone();
     window.connect_hide(move |_| bd_for_hide.set_visible(false));
 
@@ -3519,6 +3609,7 @@ fn build_window(
 
     let suggestionbox = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
+        .hexpand(true)
         .spacing(0)
         .css_classes(["suggapps"])
         .build();
@@ -3767,14 +3858,19 @@ fn build_window(
         }
 
         .win-card {
-            background-color: rgba(10, 10, 10, 0.49);
+            background-color: rgba(34, 34, 34, 0.559);
+            border: 2px solid transparent;
+            background-image: linear-gradient(rgb(29, 29, 29), rgb(29, 29, 29)),
+                                linear-gradient(0deg, rgb(19, 19, 19), rgba(94, 94, 94, 0.686));
+            background-origin: border-box;
+            background-clip: padding-box, border-box;
+            padding: 6px;
             border-radius: 35px;
-            border: 1px solid var(--pri-border);
             opacity: 0;
         }
 
         .bd-fill {
-            background: linear-gradient(to bottom, #04040498, transparent);
+            background: linear-gradient(to bottom, #04040400, transparent);
             opacity: 0;
         }
 
