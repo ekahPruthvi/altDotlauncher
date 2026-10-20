@@ -35,6 +35,7 @@ const LAUNCH_ANIM_US: i64 = 300_000;
 
 const PANEL_HEIGHT: i32 = 320;
 const PAGE_MAX: usize = 8;
+const PATH_MAX: usize = 200;
 const FILE_DEPTH: usize = 5;
 const FILE_SCAN_LIMIT: usize = 40_000;
 const FILE_MIN_QUERY: usize = 2;
@@ -1927,9 +1928,79 @@ fn refresh_file_index(force: bool) {
     }
 }
 
+fn is_path_query(q: &str) -> bool {
+    let q = q.trim();
+    q.starts_with('/') || q == "~" || q.starts_with("~/")
+}
+
+fn expand_tilde(q: &str) -> PathBuf {
+    if q == "~" {
+        return PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    }
+    if let Some(rest) = q.strip_prefix("~/") {
+        return PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest);
+    }
+    PathBuf::from(q)
+}
+
+fn search_path(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
+    let q = q.trim();
+    let full = expand_tilde(q);
+
+    let (dir, prefix): (PathBuf, String) = if q == "~" || q.ends_with('/') {
+        (full, String::new())
+    } else {
+        let prefix = full
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let dir = full.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
+        (dir, prefix)
+    };
+
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let show_hidden = prefix.starts_with('.');
+    let prefix_lc = lower_chars(&prefix);
+    let m = Matcher::new(&prefix);
+    let mut buf: Vec<char> = Vec::new();
+    let mut best: Vec<(i32, bool, String, PathBuf)> = Vec::new();
+
+    for (i, e) in rd.flatten().enumerate() {
+        if i & 0xff == 0 && generation.load(Ordering::Relaxed) != mine {
+            return Vec::new();
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && !show_hidden {
+            continue;
+        }
+        lower_into(&mut buf, &name);
+        let score = if prefix_lc.is_empty() {
+            0
+        } else if buf.starts_with(&prefix_lc) {
+            1000
+        } else if let Some(s) = m.relevant(&buf) {
+            s
+        } else {
+            continue;
+        };
+        let is_dir = e.path().is_dir();
+        best.push((score, is_dir, name.to_lowercase(), e.path()));
+    }
+
+    best.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    best.truncate(PATH_MAX);
+    best.into_iter().map(|(_, _, _, p)| p).collect()
+}
+
 fn search_files(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
     if !FILES_ENABLED {
         return Vec::new();
+    }
+    if is_path_query(q) {
+        return search_path(q, generation, mine);
     }
     let idx = FILE_INDEX.read().ok().and_then(|g| (*g).clone());
     let Some(idx) = idx else {
@@ -2443,7 +2514,11 @@ fn is_clip_query(q: &str) -> bool {
 }
 
 fn page_limit(c: Cat) -> usize {
-    if c == Cat::Clip { CLIP_ALL_MAX } else { PAGE_MAX }
+    match c {
+        Cat::Clip => CLIP_ALL_MAX,
+        Cat::Files => PATH_MAX,
+        _ => PAGE_MAX,
+    }
 }
 
 fn cliphist_delete(line: &str) {
@@ -3718,7 +3793,7 @@ impl ModePanel {
         }
         self.render();
 
-        if FILES_ENABLED && q.chars().count() >= FILE_MIN_QUERY {
+        if FILES_ENABLED && (q.chars().count() >= FILE_MIN_QUERY || is_path_query(&q)) {
             let (tx, rx) = async_channel::bounded::<Vec<PathBuf>>(1);
             let generation = self.generation.clone();
             let qq = q.clone();
@@ -4384,8 +4459,11 @@ fn build_window(
         }
 
         .win-card {
-            background-color: rgba(24, 24, 24, 0.61);
-            border: 1px solid rgba(255, 255, 255, 0.13);
+            border: 1px solid transparent;
+            background-image: linear-gradient(rgb(29, 29, 29), rgb(29, 29, 29)),
+                                linear-gradient(0deg, rgb(9, 9, 9), rgba(94, 94, 94, 0.686));
+            background-origin: border-box;
+            background-clip: padding-box, border-box;
             border-radius: 35px;
             opacity: 0;
         }
@@ -4731,7 +4809,7 @@ fn ensure_writable(path: &str) -> Result<(), String> {
         let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 };
         if !writable {
             return Err(format!(
-                "no write permission for '{}'. Try: sudo calibrate --update",
+                "no write permission for '{}'. Try: sudo altDot --update",
                 path
             ));
         }
@@ -4743,7 +4821,7 @@ fn ensure_writable(path: &str) -> Result<(), String> {
         let dir_writable = unsafe { libc::access(c_parent.as_ptr(), libc::W_OK) == 0 };
         if !dir_writable {
             return Err(format!(
-                "no write permission for directory '{}'. Try: sudo calibrate --update",
+                "no write permission for directory '{}'. Try: sudo altDot --update",
                 parent.display()
             ));
         }
@@ -4775,16 +4853,16 @@ fn run_update() -> i32 {
     println!("Checking for updates...");
 
     if let Err(msg) = ensure_writable(ALT_BIN_PATH) {
-        eprintln!("Cannot update calibrate: {}", msg);
+        eprintln!("Cannot update altDot: {}", msg);
         return 1;
     }
 
     match check_for_updates() {
         Ok(outcome) => {
             if outcome.updated {
-                println!("calibrate updated to version {}", outcome.version);
+                println!("altDot updated to version {}", outcome.version);
             } else {
-                println!("calibrate is already up to date ({})", outcome.version);
+                println!("altDot is already up to date ({})", outcome.version);
             }
             0
         }
