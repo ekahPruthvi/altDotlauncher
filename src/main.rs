@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{
     glib, pango, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image,
     Label, Overlay, Picture, ScrolledWindow, SelectionMode, Stack, StackTransitionType, Box as GtkBox,
-    MediaFile, MediaStream, TextView, Video, WrapMode,
+    MediaFile, MediaStream, TextView, WrapMode,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
@@ -3341,7 +3341,6 @@ impl PreviewPane {
                     let tv = TextView::builder()
                         .editable(false)
                         .cursor_visible(false)
-                        .monospace(true)
                         .wrap_mode(WrapMode::WordChar)
                         .left_margin(8)
                         .right_margin(8)
@@ -4674,7 +4673,7 @@ fn build_window(
         }
         textview.preview-text, textview.preview-text text {
             background-color: transparent;
-            color: rgba(253, 253, 253, 0.8);
+            color: rgba(253, 253, 253, 0.67);
             font-size: 12px;
         }
         .preview-img {
