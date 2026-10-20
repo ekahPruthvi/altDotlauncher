@@ -5,11 +5,15 @@ use gtk4::prelude::*;
 use gtk4::{
     glib, pango, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image,
     Label, Overlay, Picture, ScrolledWindow, SelectionMode, Stack, StackTransitionType, Box as GtkBox,
+    MediaFile, MediaStream, TextView, Video, WrapMode,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
+use rodio::{Decoder, OutputStream, Sink};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -24,7 +28,7 @@ use self_update::cargo_crate_version;
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
 const SUGGEST_COUNT: usize = 5;
-const SEARCH_RESULTS: usize = 4;
+const SEARCH_RESULTS: usize = 3;
 const LOGO_TEXT: &str = "alt●";
 const SEARCH_GLYPH: &str = "";
 const LAUNCH_ANIM_US: i64 = 300_000;
@@ -2025,6 +2029,7 @@ struct Hit {
     icon: String,
     thumb: Option<gtk4::gdk::Texture>,
     clip_line: Option<String>,
+    path: Option<PathBuf>,
     action: Rc<dyn Fn()>,
 }
 
@@ -2085,6 +2090,7 @@ fn file_hits(paths: Vec<PathBuf>, window: &ApplicationWindow) -> Vec<Hit> {
                 icon: if p.is_dir() { "folder" } else { "text-x-generic" }.to_string(),
                 thumb: None,
                 clip_line: None,
+                path: Some(p.clone()),
                 action: Rc::new(move || open_file_dialog(&win, &target)),
             }
         })
@@ -2148,6 +2154,7 @@ fn calc_hits(q: &str) -> Vec<Hit> {
             icon: custom_icon("calc.svg", "accessories-calculator"),
             thumb: None,
             clip_line: None,
+            path: None,
             action: Rc::new(move || copy_text(&res)),
         }],
         None => Vec::new(),
@@ -2567,6 +2574,7 @@ fn clip_hits(res: Result<Vec<ClipItem>, String>) -> Vec<Hit> {
             icon: "dialog-warning".to_string(),
             thumb: None,
             clip_line: None,
+            path: None,
             action: Rc::new(|| {}),
         }],
         Ok(items) => items
@@ -2591,6 +2599,7 @@ fn clip_hits(res: Result<Vec<ClipItem>, String>) -> Vec<Hit> {
                     },
                     thumb: it.thumb.map(|t| t.into_texture()),
                     clip_line: if clear { None } else { Some(line) },
+                    path: None,
                     action,
                 }
             })
@@ -2613,6 +2622,7 @@ fn pill_hits(q: &str) -> Vec<Hit> {
                     icon: icon.to_string(),
                     thumb: None,
                     clip_line: None,
+                    path: None,
                     action: Rc::new(move || {
                         let mut c = Command::new("sh");
                         c.arg("-c").arg(&cmd);
@@ -2632,6 +2642,7 @@ fn thumb_picture(tex: &gtk4::gdk::Texture) -> Picture {
     pic.set_size_request(64, 44);
     pic.set_valign(gtk4::Align::Center);
     pic.add_css_class("hit-thumb");
+    pic.set_overflow(gtk4::Overflow::Hidden);
     pic
 }
 
@@ -2767,12 +2778,10 @@ fn calc_help() -> GtkBox {
         .margin_top(4)
         .build();
 
-    let hero = Label::new(Some("="));
-    hero.add_css_class("help-hero");
     let title = Label::new(Some("Calculator"));
     title.add_css_class("help-title");
     title.set_xalign(0.0);
-    let sub = Label::new(Some("Type c or = and then your sum"));
+    let sub = Label::new(Some("Type c or = followed by the expression"));
     sub.add_css_class("help-sub");
     sub.set_xalign(0.0);
     let titles = GtkBox::builder()
@@ -2787,7 +2796,6 @@ fn calc_help() -> GtkBox {
         .spacing(12)
         .margin_start(2)
         .build();
-    header.append(&hero);
     header.append(&titles);
     root.append(&header);
 
@@ -2811,8 +2819,6 @@ fn calc_help() -> GtkBox {
             "Functions",
             &help_chips(&["sqrt", "sin", "cos", "tan", "ln", "log", "exp", "abs", "floor", "ceil", "round"]),
         ),
-        help_row("∞", "tile-gray", "Big numbers", &help_text("Huge powers work, shown like 5.1e2938")),
-        help_row("↵", "tile-red", "Enter", &help_text("Copies the result")),
     ];
 
     let group = GtkBox::builder()
@@ -2838,8 +2844,6 @@ fn help_panel(glyph: &str, title: &str, sub: &str, rows: Vec<GtkBox>) -> GtkBox 
         .margin_top(4)
         .build();
 
-    let hero = Label::new(Some(glyph));
-    hero.add_css_class("help-hero");
     let title = Label::new(Some(title));
     title.add_css_class("help-title");
     title.set_xalign(0.0);
@@ -2858,7 +2862,6 @@ fn help_panel(glyph: &str, title: &str, sub: &str, rows: Vec<GtkBox>) -> GtkBox 
         .spacing(12)
         .margin_start(2)
         .build();
-    header.append(&hero);
     header.append(&titles);
     root.append(&header);
 
@@ -2893,13 +2896,7 @@ fn clip_help() -> GtkBox {
         "Clipboard",
         "Type clip to browse everything you copied",
         vec![
-            help_row("⧉", "tile-blue", "Browse", &help_chips(&["clip", "clipboard"])),
-            help_row(
-                "⌕",
-                "tile-teal",
-                "Search",
-                &help_chips(&["search", "clip png",]),
-            ),
+            help_row("⧉", "tile-blue", "Search", &help_chips(&["clip", "clipboard", "TEXT"])),
             help_row("⌫", "tile-orange", "Delete", &help_text("Select an entry with ↑ ↓, then press Del")),
             help_row("✕", "tile-red", "Clear all", &clear),
             help_row("↵", "tile-green", "Enter", &help_text("Selects in clipboard: text, images and files")),
@@ -2925,6 +2922,502 @@ fn select_page(stack: &Stack, tabs: &[(&'static str, Button)], id: &str) {
     }
 }
 
+const PREVIEW_W: i32 = 380;
+const PREVIEW_TEXT_BYTES: usize = 16 * 1024;
+const PREVIEW_BOX_W: i32 = 356;
+const PREVIEW_BOX_H: i32 = 246;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewKind {
+    Text,
+    Image,
+    Audio,
+    Video,
+    Pdf,
+    Other,
+}
+
+impl PreviewKind {
+    fn label(self) -> &'static str {
+        match self {
+            PreviewKind::Text => "Text",
+            PreviewKind::Image => "Image",
+            PreviewKind::Audio => "Audio",
+            PreviewKind::Video => "Video",
+            PreviewKind::Pdf => "PDF",
+            PreviewKind::Other => "File",
+        }
+    }
+}
+
+fn looks_like_text(p: &Path) -> bool {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(p) else {
+        return false;
+    };
+    let mut buf = Vec::with_capacity(4096);
+    if f.take(4096).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    if buf.contains(&0) {
+        return false;
+    }
+    String::from_utf8_lossy(&buf).chars().filter(|c| *c == '\u{FFFD}').count() <= 2
+}
+
+fn preview_kind(p: &Path) -> PreviewKind {
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "ico" | "avif" => {
+            PreviewKind::Image
+        }
+        "mp3" | "wav" | "ogg" | "oga" | "flac" | "m4a" | "aac" | "opus" | "wma" => PreviewKind::Audio,
+        "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "ogv" => PreviewKind::Video,
+        "pdf" => PreviewKind::Pdf,
+        _ => {
+            if looks_like_text(p) {
+                PreviewKind::Text
+            } else {
+                PreviewKind::Other
+            }
+        }
+    }
+}
+
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn read_text_preview(p: &Path) -> String {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(p) else {
+        return "Can't read this file".to_string();
+    };
+    let mut buf = Vec::with_capacity(PREVIEW_TEXT_BYTES);
+    if f.take(PREVIEW_TEXT_BYTES as u64 + 1).read_to_end(&mut buf).is_err() {
+        return "Can't read this file".to_string();
+    }
+    let truncated = buf.len() > PREVIEW_TEXT_BYTES;
+    buf.truncate(PREVIEW_TEXT_BYTES);
+    let mut text = String::from_utf8_lossy(&buf).to_string();
+    if text.is_empty() {
+        return "(empty file)".to_string();
+    }
+    if truncated {
+        text.push_str("\n\n…");
+    }
+    text
+}
+
+fn pixbuf_to_thumb(pb: gtk4::gdk_pixbuf::Pixbuf) -> Option<ThumbPixels> {
+    let flat = pb.copy()?;
+    Some(ThumbPixels {
+        w: flat.width(),
+        h: flat.height(),
+        stride: flat.rowstride() as usize,
+        alpha: flat.has_alpha(),
+        data: flat.read_pixel_bytes().to_vec(),
+    })
+}
+
+fn load_scaled(p: &Path, w: i32, h: i32) -> Option<ThumbPixels> {
+    let pb = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(p, w, h, true).ok()?;
+    let pb = pb.apply_embedded_orientation().unwrap_or(pb);
+    pixbuf_to_thumb(pb)
+}
+
+fn load_cover(p: &Path, w: i32, h: i32) -> Option<ThumbPixels> {
+    use gtk4::gdk_pixbuf::Pixbuf;
+    let Some((_, iw, ih)) = Pixbuf::file_info(p) else {
+        return load_scaled(p, w, h);
+    };
+    let (iw, ih) = (iw.max(1), ih.max(1));
+    let scale = (w as f64 / iw as f64).max(h as f64 / ih as f64);
+    let sw = ((iw as f64 * scale).ceil() as i32).max(w);
+    let sh = ((ih as f64 * scale).ceil() as i32).max(h);
+    let pb = Pixbuf::from_file_at_scale(p, sw, sh, false).ok()?;
+    let pb = pb.apply_embedded_orientation().unwrap_or(pb);
+    let (pw, ph) = (pb.width(), pb.height());
+    let (cw, ch) = (w.min(pw), h.min(ph));
+    let sub = pb.new_subpixbuf((pw - cw) / 2, (ph - ch) / 2, cw, ch);
+    pixbuf_to_thumb(sub)
+}
+
+fn render_pdf_first_page(p: &Path, id: u64) -> Result<ThumbPixels, String> {
+    let base = std::env::temp_dir().join(format!("altdot-pdf-{}-{}", std::process::id(), id));
+    let png = base.with_extension("png");
+    let status = Command::new("pdftoppm")
+        .args(["-png", "-singlefile", "-f", "1", "-l", "1", "-r", "90"])
+        .arg(p)
+        .arg(&base)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let ok = match status {
+        Ok(s) => s.success(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("Install poppler-utils (pdftoppm) to preview PDFs".to_string());
+        }
+        Err(_) => false,
+    };
+    let res = if ok {
+        load_cover(&png, PREVIEW_BOX_W, PREVIEW_BOX_H)
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&png);
+    res.ok_or_else(|| "Can't render this PDF".to_string())
+}
+
+struct PreviewPane {
+    root: GtkBox,
+    meta: Label,
+    content: GtkBox,
+    media: RefCell<Option<MediaStream>>,
+    audio: RefCell<Option<(OutputStream, Sink)>>,
+    current: RefCell<Option<PathBuf>>,
+    gen: Cell<u64>,
+}
+
+impl PreviewPane {
+    fn new() -> Rc<Self> {
+        let root = GtkBox::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .spacing(6)
+            .margin_top(10)
+            .margin_end(20)
+            .margin_bottom(14)
+            .css_classes(["preview-pane"])
+            .visible(false)
+            .build();
+        root.set_size_request(PREVIEW_W, -1);
+
+        let meta = Label::new(None);
+        meta.add_css_class("preview-meta");
+        meta.set_xalign(0.0);
+
+        let content = GtkBox::builder()
+            .orientation(gtk4::Orientation::Vertical)
+            .vexpand(false)
+            .hexpand(false)
+            .overflow(gtk4::Overflow::Hidden)
+            .valign(gtk4::Align::Start)
+            .build();
+        content.set_size_request(PREVIEW_BOX_W, PREVIEW_BOX_H);
+
+        root.append(&meta);
+        root.append(&content);
+
+        Rc::new(Self {
+            root,
+            meta,
+            content,
+            media: RefCell::new(None),
+            audio: RefCell::new(None),
+            current: RefCell::new(None),
+            gen: Cell::new(0),
+        })
+    }
+
+    fn stop_media(&self) {
+        if let Some(m) = self.media.borrow_mut().take() {
+            m.pause();
+            if let Some(mf) = m.downcast_ref::<MediaFile>() {
+                mf.clear();
+            }
+        }
+        if let Some((_stream, sink)) = self.audio.borrow_mut().take() {
+            sink.stop();
+        }
+    }
+
+    fn clear(&self) {
+        self.gen.set(self.gen.get() + 1);
+        self.stop_media();
+        self.current.borrow_mut().take();
+        clear_box(&self.content);
+        self.root.set_visible(false);
+    }
+
+    fn set_content(&self, w: &gtk4::Widget) {
+        self.stop_media();
+        clear_box(&self.content);
+        if !w.is::<Picture>() {
+            w.set_hexpand(true);
+            w.set_vexpand(true);
+        }
+        self.content.append(w);
+    }
+
+    fn message(&self, text: &str) -> Label {
+        let l = Label::new(Some(text));
+        l.add_css_class("preview-note");
+        l.set_wrap(true);
+        l.set_justify(gtk4::Justification::Center);
+        l
+    }
+
+    fn spawn_load<T: Send + 'static>(
+        self: &Rc<Self>,
+        id: u64,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: impl FnOnce(&Rc<Self>, T) + 'static,
+    ) {
+        let (tx, rx) = async_channel::bounded::<T>(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(work());
+        });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(v) = rx.recv().await {
+                if me.gen.get() == id {
+                    done(&me, v);
+                }
+            }
+        });
+    }
+
+    fn show_thumb(&self, px: Option<ThumbPixels>, err: &str) {
+        match px {
+            Some(px) => {
+                let (pw, ph) = (px.w, px.h);
+                let pic = Picture::for_paintable(&px.into_texture());
+                pic.set_can_shrink(true);
+                pic.set_size_request(pw, ph);
+                pic.set_halign(gtk4::Align::Center);
+                pic.set_valign(gtk4::Align::Center);
+                pic.set_focusable(false);
+                pic.add_css_class("preview-img");
+                pic.set_overflow(gtk4::Overflow::Hidden);
+                self.set_content(pic.upcast_ref());
+            }
+            None => self.set_content(self.message(err).upcast_ref()),
+        }
+    }
+
+    fn toggle_audio(&self, path: &Path, btn: &Button) {
+        let mut slot = self.audio.borrow_mut();
+        if let Some((_, sink)) = slot.as_ref() {
+            if !sink.empty() {
+                if sink.is_paused() {
+                    sink.play();
+                    btn.set_label("⏸");
+                } else {
+                    sink.pause();
+                    btn.set_label("▶");
+                }
+                return;
+            }
+        }
+        *slot = None;
+        let (stream, handle) = match OutputStream::try_default() {
+            Ok(v) => v,
+            Err(_) => {
+                btn.set_label("No audio device");
+                return;
+            }
+        };
+        let sink = match Sink::try_new(&handle) {
+            Ok(s) => s,
+            Err(_) => {
+                btn.set_label("No audio device");
+                return;
+            }
+        };
+        let source = File::open(path)
+            .ok()
+            .and_then(|f| Decoder::new(BufReader::new(f)).ok());
+        match source {
+            Some(src) => {
+                sink.append(src);
+                *slot = Some((stream, sink));
+                btn.set_label("⏸");
+            }
+            None => btn.set_label("Can't play this format"),
+        }
+    }
+
+    fn start_video(&self, path: &Path) {
+        let mf = MediaFile::for_filename(path);
+        mf.set_loop(true);
+        mf.set_muted(true);
+        let video = Picture::for_paintable(&mf);
+        video.set_focusable(false);
+        video.set_overflow(gtk4::Overflow::Hidden);
+        video.set_size_request(PREVIEW_BOX_W, PREVIEW_BOX_H);
+        let clip = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::External)
+            .vscrollbar_policy(gtk4::PolicyType::External)
+            .min_content_width(PREVIEW_BOX_W)
+            .max_content_width(PREVIEW_BOX_W)
+            .min_content_height(PREVIEW_BOX_H)
+            .max_content_height(PREVIEW_BOX_H)
+            .propagate_natural_width(false)
+            .propagate_natural_height(false)
+            .focusable(false)
+            .overflow(gtk4::Overflow::Hidden)
+            .child(&video)
+            .build();
+
+        let overlay = Overlay::new();
+        overlay.set_child(Some(&clip));
+        overlay.set_overflow(gtk4::Overflow::Hidden);
+        overlay.add_css_class("preview-video");
+
+        let play_btn = Button::with_label("⏸");
+        play_btn.add_css_class("video-play-btn");
+        play_btn.set_focusable(false);
+        play_btn.set_halign(gtk4::Align::End);
+        play_btn.set_valign(gtk4::Align::End);
+        play_btn.set_margin_bottom(10);
+        play_btn.set_margin_end(10);
+        overlay.add_overlay(&play_btn);
+
+        let weak_mf = mf.downgrade();
+        let toggle = move || {
+            if let Some(mf) = weak_mf.upgrade() {
+                if mf.is_playing() {
+                    mf.pause();
+                } else {
+                    mf.play();
+                }
+            }
+        };
+
+        {
+            let toggle = toggle.clone();
+            play_btn.connect_clicked(move |_| toggle());
+        }
+        let click = gtk4::GestureClick::new();
+        click.connect_released(move |_, _, _, _| toggle());
+        clip.add_controller(click);
+
+        {
+            let weak_btn = play_btn.downgrade();
+            mf.connect_playing_notify(move |m| {
+                if let Some(btn) = weak_btn.upgrade() {
+                    btn.set_label(if m.is_playing() { "⏸" } else { "▶" });
+                }
+            });
+        }
+
+        self.set_content(overlay.upcast_ref());
+        *self.media.borrow_mut() = Some(mf.clone().upcast());
+        mf.play();
+    }
+
+    fn show(self: &Rc<Self>, path: &Path) {
+        if self.current.borrow().as_deref() == Some(path) {
+            return;
+        }
+        let id = self.gen.get() + 1;
+        self.gen.set(id);
+        *self.current.borrow_mut() = Some(path.to_path_buf());
+
+        let kind = preview_kind(path);
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.meta.set_text(&format!("{} · {}", kind.label(), human_size(size)));
+        self.root.set_visible(true);
+
+        let p = path.to_path_buf();
+        match kind {
+            PreviewKind::Text => {
+                self.set_content(self.message("Loading…").upcast_ref());
+                self.spawn_load(id, move || read_text_preview(&p), |me, text| {
+                    let tv = TextView::builder()
+                        .editable(false)
+                        .cursor_visible(false)
+                        .monospace(true)
+                        .wrap_mode(WrapMode::WordChar)
+                        .left_margin(8)
+                        .right_margin(8)
+                        .top_margin(6)
+                        .bottom_margin(6)
+                        .focusable(false)
+                        .css_classes(["preview-text"])
+                        .build();
+                    tv.buffer().set_text(&text);
+                    let sw = ScrolledWindow::builder()
+                        .hscrollbar_policy(gtk4::PolicyType::Never)
+                        .focusable(false)
+                        .child(&tv)
+                        .build();
+                    me.set_content(sw.upcast_ref());
+                });
+            }
+            PreviewKind::Image => {
+                self.set_content(self.message("Loading…").upcast_ref());
+                self.spawn_load(
+                    id,
+                    move || load_cover(&p, PREVIEW_BOX_W, PREVIEW_BOX_H),
+                    |me, px| me.show_thumb(px, "Can't preview this image"),
+                );
+            }
+            PreviewKind::Pdf => {
+                self.set_content(self.message("Rendering…").upcast_ref());
+                self.spawn_load(id, move || render_pdf_first_page(&p, id), |me, res| match res {
+                    Ok(px) => me.show_thumb(Some(px), ""),
+                    Err(msg) => me.set_content(me.message(&msg).upcast_ref()),
+                });
+            }
+            PreviewKind::Video => {
+                self.set_content(self.message("Loading…").upcast_ref());
+                let me = self.clone();
+                glib::timeout_add_local_once(Duration::from_millis(180), move || {
+                    if me.gen.get() != id {
+                        return;
+                    }
+                    me.start_video(&p);
+                });
+            }
+            PreviewKind::Audio => {
+                let icon = Image::from_file("/var/lib/cynager/icons/audio.svg");
+                icon.set_pixel_size(96);
+                icon.add_css_class("preview-note");
+                icon.set_vexpand(true);
+                icon.set_valign(gtk4::Align::Center);
+                let btn = Button::with_label("▶");
+                btn.add_css_class("video-play-btn");
+                btn.set_focusable(false);
+                btn.set_halign(gtk4::Align::End);
+                btn.set_valign(gtk4::Align::End);
+                btn.set_margin_bottom(10);
+                btn.set_margin_end(10);
+                let me = self.clone();
+                let b2 = btn.clone();
+                btn.connect_clicked(move |_| me.toggle_audio(&p, &b2));
+                let b = GtkBox::builder()
+                    .orientation(gtk4::Orientation::Vertical)
+                    .spacing(14)
+                    .vexpand(true)
+                    .height_request(200)
+                    .valign(gtk4::Align::End)
+                    .build();
+                b.append(&icon);
+                b.append(&btn);
+                self.set_content(b.upcast_ref());
+            }
+            PreviewKind::Other => {
+                self.set_content(self.message("No preview available").upcast_ref());
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ModePanel {
     window: ApplicationWindow,
@@ -2941,6 +3434,7 @@ struct ModePanel {
     calc_help: GtkBox,
     clip_help: GtkBox,
     dirty: Rc<Cell<u32>>,
+    preview: Rc<PreviewPane>,
 }
 
 const DIRTY_HOME: u32 = 1 << 5;
@@ -2983,6 +3477,7 @@ impl ModePanel {
             .spacing(8)
             .margin_start(20)
             .margin_end(20)
+            .margin_bottom(5)
             .margin_top(12)
             .css_classes(["mode-tabs"])
             .build();
@@ -3007,8 +3502,23 @@ impl ModePanel {
             .child(&stack)
             .build();
 
+        let preview = PreviewPane::new();
+        scroller.set_hexpand(true);
+        let body = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).build();
+        body.append(&scroller);
+        body.append(&preview.root);
+
         host.append(&tabbar);
-        host.append(&scroller);
+        host.append(&body);
+
+        {
+            let pv = preview.clone();
+            window.connect_visible_notify(move |w| {
+                if !w.is_visible() {
+                    pv.clear();
+                }
+            });
+        }
 
         let panel = Self {
             window: window.clone(),
@@ -3025,6 +3535,7 @@ impl ModePanel {
             calc_help: calc_help(),
             clip_help: clip_help(),
             dirty: Rc::new(Cell::new(DIRTY_ALL)),
+            preview,
         };
 
         for (id, b) in panel.tabs.clone() {
@@ -3116,6 +3627,22 @@ impl ModePanel {
         }
         if let Some(i) = cur {
             self.scroll_to(&rows[i]);
+        }
+        self.update_preview();
+    }
+
+    fn update_preview(&self) {
+        let on_files = self.stack.visible_child_name().map_or(false, |n| n == "files");
+        let path = if on_files && self.focused.get() {
+            self.visible_hits()
+                .get(self.sel.get().unwrap_or(0))
+                .and_then(|h| h.path.clone())
+        } else {
+            None
+        };
+        match path {
+            Some(p) if p.is_file() => self.preview.show(&p),
+            _ => self.preview.clear(),
         }
     }
 
@@ -3858,13 +4385,8 @@ fn build_window(
         }
 
         .win-card {
-            background-color: rgba(34, 34, 34, 0.559);
-            border: 2px solid transparent;
-            background-image: linear-gradient(rgb(29, 29, 29), rgb(29, 29, 29)),
-                                linear-gradient(0deg, rgb(19, 19, 19), rgba(94, 94, 94, 0.686));
-            background-origin: border-box;
-            background-clip: padding-box, border-box;
-            padding: 6px;
+            background-color: rgba(24, 24, 24, 0.61);
+            border: 1px solid rgba(255, 255, 255, 0.13);
             border-radius: 35px;
             opacity: 0;
         }
@@ -3955,11 +4477,11 @@ fn build_window(
         .sugg-idx {
             padding: 5px;
             min-width: 15px;
-            background-color: rgba(0, 0, 0, 0.53);
+            background-color: rgba(254, 252, 252, 0.16);
             border-radius: 5px;
             font-size: 11px;
             font-weight: 600;
-            color: rgba(253, 253, 253, 0.4);
+            color: rgba(253, 253, 253, 0.56);
         }
 
         entry.search-entry {
@@ -4129,6 +4651,50 @@ fn build_window(
 
         .hit-thumb {
             border-radius: 8px;
+        }
+
+        .preview-pane {
+            padding: 12px;
+            border-radius: 16px;
+            background-color: rgba(255, 255, 255, 0.05);
+        }
+        .preview-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: rgba(253, 253, 253, 0.9);
+        }
+        .preview-meta {
+            font-size: 12px;
+            color: rgba(253, 253, 253, 0.45);
+            margin-bottom: 4px;
+        }
+        .preview-note {
+            font-size: 13px;
+            color: rgba(253, 253, 253, 0.45);
+        }
+        textview.preview-text, textview.preview-text text {
+            background-color: transparent;
+            color: rgba(253, 253, 253, 0.8);
+            font-size: 12px;
+        }
+        .preview-img {
+            border-radius: 10px;
+        }
+        .preview-video {
+            border-radius: 12px;
+            background-color: rgba(255, 255, 255, 0.13);
+        }
+        .video-play-btn {
+            min-width: 36px;
+            min-height: 36px;
+            padding: 0;
+            border-radius: 18px;
+            font-size: 14px;
+            color: rgba(253, 253, 253, 0.95);
+            background-color: rgba(0, 0, 0, 0.55);
+        }
+        .video-play-btn:hover {
+            background-color: rgba(0, 0, 0, 0.75);
         }
 
         .pagetitle {
