@@ -30,11 +30,11 @@ const SAVE_EVERY_SECS: u64 = 60;
 const SUGGEST_COUNT: usize = 5;
 const SEARCH_RESULTS: usize = 3;
 const LOGO_TEXT: &str = "alt●";
-const SEARCH_GLYPH: &str = "";
+const SEARCH_GLYPH: &str = "Search";
 const LAUNCH_ANIM_US: i64 = 300_000;
 
 const PANEL_HEIGHT: i32 = 320;
-const PAGE_MAX: usize = 8;
+const PAGE_MAX: usize = 20;
 const PATH_MAX: usize = 200;
 const FILE_DEPTH: usize = 5;
 const FILE_SCAN_LIMIT: usize = 40_000;
@@ -827,6 +827,43 @@ fn terminal_app_argv(info: &AppInfo, file: Option<&Path>) -> Option<Vec<String>>
     Some(argv)
 }
 
+fn capsule_state() -> Option<String> {
+    let out = Command::new("capsule").arg("-D").output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn desktop_needs_show() -> bool {
+    capsule_state().as_deref() == Some("desktop")
+}
+
+fn signal_capsule() {
+    match Command::new("pkill").args(["-USR1", "capsule"]).status() {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("[altDot] pkill found no capsule process ({s})");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[altDot] Failed to show desktop: {e}");
+            return;
+        }
+    }
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(25));
+        if capsule_state().as_deref() != Some("desktop") {
+            break;
+        }
+    }
+}
+
+fn show_desktop_then(window: &ApplicationWindow, f: impl FnOnce() + 'static) {
+    window.set_visible(false);
+    glib::timeout_add_local_once(Duration::from_millis(150), move || {
+        signal_capsule();
+        f();
+    });
+}
+
 fn run_app(info: &AppInfo, term: Option<&'static str>, file: Option<&Path>) -> Result<(), String> {
     match term {
         Some(t) => {
@@ -979,6 +1016,15 @@ fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
 }
 
 fn launch_file(info: &AppInfo, term: Option<&'static str>, path: &Path, window: &ApplicationWindow) {
+    if desktop_needs_show() {
+        let (info, path) = (info.clone(), path.to_path_buf());
+        show_desktop_then(window, move || {
+            if let Err(e) = run_app(&info, term, Some(&path)) {
+                eprintln!("Failed to open {} with {}: {}", path.display(), info.display_name(), e);
+            }
+        });
+        return;
+    }
     if let Err(e) = run_app(info, term, Some(path)) {
         eprintln!("Failed to open {} with {}: {}", path.display(), info.display_name(), e);
     }
@@ -1091,6 +1137,13 @@ fn open_file_dialog(window: &ApplicationWindow, path: &Path) {
 
     match apps.len() {
         0 => {
+            if desktop_needs_show() {
+                let uri = file.uri();
+                show_desktop_then(window, move || {
+                    let _ = AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>);
+                });
+                return;
+            }
             let _ = AppInfo::launch_default_for_uri(&file.uri(), None::<&gio::AppLaunchContext>);
             window.set_visible(false);
         }
@@ -1156,6 +1209,14 @@ fn reset_launch(window: &ApplicationWindow) {
     }
 }
 
+fn launch_after_desktop(window: &ApplicationWindow, info: AppInfo, term: Option<&'static str>) {
+    show_desktop_then(window, move || {
+        if let Err(e) = run_app(&info, term, None) {
+            eprintln!("Failed to launch {}: {}", info.display_name(), e);
+        }
+    });
+}
+
 fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, term: Option<&'static str>) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
         let _ = run_app(info, term, None);
@@ -1166,7 +1227,10 @@ fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
         return;
     }
 
-    if let Err(e) = run_app(info, term, None) {
+    let pending: RefCell<Option<AppInfo>> = RefCell::new(None);
+    if desktop_needs_show() {
+        *pending.borrow_mut() = Some(info.clone());
+    } else if let Err(e) = run_app(info, term, None) {
         eprintln!("Failed to launch {}: {}", info.display_name(), e);
         window.set_visible(false);
         return;
@@ -1174,11 +1238,17 @@ fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
 
     let (ow, oh) = (overlay.width(), overlay.height());
     let (Some(card), Some(b)) = (overlay.child(), source.compute_bounds(&overlay)) else {
-        window.set_visible(false);
+        match pending.borrow_mut().take() {
+            Some(i) => launch_after_desktop(window, i, term),
+            None => window.set_visible(false),
+        }
         return;
     };
     if ow <= 0 || oh <= 0 {
-        window.set_visible(false);
+        match pending.borrow_mut().take() {
+            Some(i) => launch_after_desktop(window, i, term),
+            None => window.set_visible(false),
+        }
         return;
     }
 
@@ -1233,6 +1303,9 @@ fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
         if t >= 1.0 {
             win.set_visible(false);
             reset_launch(&win);
+            if let Some(info) = pending.borrow_mut().take() {
+                launch_after_desktop(&win, info, term);
+            }
             return glib::ControlFlow::Break;
         }
         glib::ControlFlow::Continue
@@ -2912,7 +2985,7 @@ fn calc_help() -> GtkBox {
     root
 }
 
-fn help_panel(glyph: &str, title: &str, sub: &str, rows: Vec<GtkBox>) -> GtkBox {
+fn help_panel(title: &str, sub: &str, rows: Vec<GtkBox>) -> GtkBox {
     let root = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
         .spacing(14)
@@ -2967,7 +3040,6 @@ fn clip_help() -> GtkBox {
     clear.append(&help_text("then Enter wipes the whole history"));
 
     help_panel(
-        "⧉",
         "Clipboard",
         "Type clip to browse everything you copied",
         vec![
@@ -4459,9 +4531,9 @@ fn build_window(
         }
 
         .win-card {
-            border: 1px solid transparent;
+            border: 2px solid transparent;
             background-image: linear-gradient(rgb(29, 29, 29), rgb(29, 29, 29)),
-                                linear-gradient(0deg, rgb(9, 9, 9), rgba(94, 94, 94, 0.686));
+                                linear-gradient(0deg, rgb(19, 19, 19), rgb(49, 49, 49));
             background-origin: border-box;
             background-clip: padding-box, border-box;
             border-radius: 35px;

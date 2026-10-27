@@ -12,7 +12,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build Rust Binary in Arch Docker
         run: |
@@ -26,8 +26,6 @@ jobs:
           tar -czvf altDot-x86_64.tar.gz -C target/release/ altDot
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: altDot-x86_64.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
