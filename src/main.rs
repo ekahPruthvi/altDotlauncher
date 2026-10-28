@@ -2016,6 +2016,24 @@ fn expand_tilde(q: &str) -> PathBuf {
     PathBuf::from(q)
 }
 
+fn path_completion(q: &str, p: &Path) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let s = p.to_string_lossy().to_string();
+    let mut disp = if q.starts_with('~') && !home.is_empty() && s.starts_with(&home) {
+        format!("~{}", &s[home.len()..])
+    } else {
+        s
+    };
+    if p.is_dir() && !disp.ends_with('/') {
+        disp.push('/');
+    }
+    if disp.to_lowercase().starts_with(&q.to_lowercase()) && disp.chars().count() > q.chars().count() {
+        Some(disp)
+    } else {
+        None
+    }
+}
+
 fn search_path(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
     let q = q.trim();
     let full = expand_tilde(q);
@@ -3581,13 +3599,24 @@ struct ModePanel {
     clip_help: GtkBox,
     dirty: Rc<Cell<u32>>,
     preview: Rc<PreviewPane>,
+    entry: GtkEntry,
+    ghost: Label,
+    ghost_full: Rc<RefCell<Option<String>>>,
+    accepting: Rc<Cell<bool>>,
 }
 
 const DIRTY_HOME: u32 = 1 << 5;
 const DIRTY_ALL: u32 = 0x3f;
 
 impl ModePanel {
-    fn new(window: &ApplicationWindow, host: &GtkBox, _display: &Display, apps_box: &GtkBox) -> Self {
+    fn new(
+        window: &ApplicationWindow,
+        host: &GtkBox,
+        _display: &Display,
+        apps_box: &GtkBox,
+        entry: &GtkEntry,
+        ghost: &Label,
+    ) -> Self {
         ensure_cliphist_watchers();
 
         let stack = Stack::builder()
@@ -3682,6 +3711,10 @@ impl ModePanel {
             clip_help: clip_help(),
             dirty: Rc::new(Cell::new(DIRTY_ALL)),
             preview,
+            entry: entry.clone(),
+            ghost: ghost.clone(),
+            ghost_full: Rc::new(RefCell::new(None)),
+            accepting: Rc::new(Cell::new(false)),
         };
 
         for (id, b) in panel.tabs.clone() {
@@ -3835,7 +3868,52 @@ impl ModePanel {
         self.select(self.tabs[n].0);
     }
 
+    fn clear_ghost(&self) {
+        self.ghost.set_visible(false);
+        self.ghost.set_text("");
+        *self.ghost_full.borrow_mut() = None;
+    }
+
+    fn accept_completion(&self) -> bool {
+        let Some(full) = self.ghost_full.borrow().clone() else {
+            return false;
+        };
+        self.accepting.set(true);
+        self.entry.set_text(&full);
+        self.accepting.set(false);
+        self.entry.set_position(-1);
+        true
+    }
+
+    fn update_ghost(&self, q: &str) {
+        let typed = self.entry.text().to_string();
+        let full = if is_path_query(q) && typed == q {
+            self.results.borrow()[Cat::Files.idx()]
+                .first()
+                .and_then(|h| h.path.as_deref())
+                .and_then(|p| path_completion(q, p))
+        } else {
+            None
+        };
+        match full {
+            Some(f) => {
+                let n = typed.chars().count();
+                let suffix: String = f.chars().skip(n).collect();
+                let markup = format!(
+                    "<span alpha=\"1\">{}</span>{}",
+                    glib::markup_escape_text(&typed),
+                    glib::markup_escape_text(&suffix)
+                );
+                self.ghost.set_markup(&markup);
+                self.ghost.set_visible(true);
+                *self.ghost_full.borrow_mut() = Some(f);
+            }
+            None => self.clear_ghost(),
+        }
+    }
+
     fn reset(&self) {
+        self.clear_ghost();
         self.generation.fetch_add(1, Ordering::SeqCst);
         for r in self.results.borrow_mut().iter_mut() {
             r.clear();
@@ -3877,6 +3955,7 @@ impl ModePanel {
                 });
 
             let panel = self.clone();
+            let q_ghost = q.clone();
             glib::spawn_future_local(async move {
                 if let Ok(paths) = rx.recv().await {
                     if panel.generation.load(Ordering::SeqCst) == mine {
@@ -3887,6 +3966,7 @@ impl ModePanel {
                             panel.results.borrow_mut()[Cat::Files.idx()] = hits;
                             panel.render_cats(&[Cat::Files]);
                         }
+                        panel.update_ghost(&q_ghost);
                     }
                 }
             });
@@ -4275,10 +4355,26 @@ fn build_window(
         .has_frame(false)
         .hexpand(true)
         .visible(false)
-        .margin_start(10)
         .css_classes(["search-entry"])
         .build();
-    header.append(&search_entry);
+
+    let ghost_label = Label::builder()
+        .halign(gtk4::Align::Start)
+        .valign(gtk4::Align::Center)
+        .margin_start(6)
+        .visible(false)
+        .css_classes(["search-ghost"])
+        .build();
+    ghost_label.set_can_target(false);
+    ghost_label.set_wrap(false);
+
+    let entry_wrap = Overlay::new();
+    entry_wrap.set_child(Some(&search_entry));
+    entry_wrap.add_overlay(&ghost_label);
+    entry_wrap.set_overflow(gtk4::Overflow::Hidden);
+    entry_wrap.set_hexpand(true);
+    entry_wrap.set_margin_start(10);
+    header.append(&entry_wrap);
 
     let suggestionbox = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -4324,7 +4420,7 @@ fn build_window(
     card.append(&mode_panel);
 
     let display = Display::default().expect("no display");
-    let panel = ModePanel::new(&window, &mode_panel, &display, &suggestionbox);
+    let panel = ModePanel::new(&window, &mode_panel, &display, &suggestionbox, &search_entry, &ghost_label);
 
     let search = SearchUi {
         entry: search_entry,
@@ -4395,6 +4491,13 @@ fn build_window(
                         ui.panel.move_hit(-1);
                         return glib::Propagation::Stop;
                     }
+                    gtk4::gdk::Key::Alt_L | gtk4::gdk::Key::Alt_R => {
+                        if !ui.panel.mode_focused() {
+                            if ui.panel.accept_completion() {
+                                return glib::Propagation::Stop;
+                            }
+                        }
+                    }
                     gtk4::gdk::Key::Delete | gtk4::gdk::Key::KP_Delete => {
                         if ui.panel.delete_current() {
                             return glib::Propagation::Stop;
@@ -4459,8 +4562,12 @@ fn build_window(
                 return;
             }
             let q = e.text().to_string();
+            if ui.panel.accepting.get() && q.is_empty() {
+                return;
+            }
             let generation = query_generation.get().wrapping_add(1);
             query_generation.set(generation);
+            ui.panel.clear_ghost();
 
             if q.trim().is_empty() {
                 ui.panel.generation.fetch_add(1, Ordering::SeqCst);
@@ -4486,7 +4593,8 @@ fn build_window(
             {
                 let ui = ui.clone();
                 let qg = query_generation.clone();
-                glib::timeout_add_local_once(Duration::from_millis(MODE_DEBOUNCE_MS), move || {
+                let mode_delay = if is_path_query(&q) { FAST_DEBOUNCE_MS } else { MODE_DEBOUNCE_MS };
+                glib::timeout_add_local_once(Duration::from_millis(mode_delay), move || {
                     if qg.get() != generation || !ui.active() {
                         return;
                     }
@@ -4642,6 +4750,12 @@ fn build_window(
             color: rgba(253, 253, 253, 0.29);
             padding: 0 6px;
             min-height: 0;
+        }
+
+        label.search-ghost {
+            font-size: 16px;
+            color: rgba(253, 253, 253, 0.2);
+            padding: 0;
         }
 
         .sugg-name {

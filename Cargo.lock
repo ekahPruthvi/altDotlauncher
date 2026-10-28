@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "altDot"
-version = "1.2.23"
+version = "1.2.30"
 dependencies = [
  "async-channel",
  "chrono",
