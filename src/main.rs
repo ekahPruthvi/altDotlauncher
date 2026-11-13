@@ -3,27 +3,27 @@ use gtk4::gdk::Display;
 use gtk4::gio::{self, AppInfo};
 use gtk4::prelude::*;
 use gtk4::{
-    glib, pango, Application, ApplicationWindow, Button, CssProvider, Entry as GtkEntry, FlowBox, IconTheme, Image,
-    Label, Overlay, Picture, ScrolledWindow, SelectionMode, Stack, StackTransitionType, Box as GtkBox,
-    MediaFile, MediaStream, TextView, WrapMode,
+    glib, pango, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider,
+    Entry as GtkEntry, FlowBox, IconTheme, Image, Label, MediaFile, MediaStream, Overlay, Picture,
+    ScrolledWindow, SelectionMode, Stack, StackTransitionType, TextView, WrapMode,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use infoprober::{Document, Entry};
 use rodio::{Decoder, OutputStream, Sink};
+use self_update::cargo_crate_version;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::exit;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use std::process::exit;
-use self_update::cargo_crate_version;
 
 const POLL_SECS: u64 = 5;
 const SAVE_EVERY_SECS: u64 = 60;
@@ -52,12 +52,17 @@ const FAST_DEBOUNCE_MS: u64 = 70;
 const MODE_DEBOUNCE_MS: u64 = 500;
 const FILE_INDEX_TTL: Duration = Duration::from_secs(120);
 const CLIP_LIST_TTL: Duration = Duration::from_millis(1500);
-const FILE_SKIP_DIRS: [&str; 5] = ["node_modules", "target", "venv", "__pycache__", "site-packages"];
+const FILE_SKIP_DIRS: [&str; 5] = [
+    "node_modules",
+    "target",
+    "venv",
+    "__pycache__",
+    "site-packages",
+];
 
 const TERMINALS: [(&str, &[&str]); 2] = [("kitty", &[]), ("xterm", &["-e"])];
 
-const PILLS: [(&str, &str, &str); 0] = [
-];
+const PILLS: [(&str, &str, &str); 0] = [];
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
@@ -125,7 +130,8 @@ fn spawn_signal_listener() -> async_channel::Receiver<i32> {
             if tx.send_blocking(b as i32).is_err() {
                 break;
             }
-        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        } else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
             continue;
         } else {
             break;
@@ -237,7 +243,6 @@ fn save_usage(usage: &Usage) {
     }
 }
 
-
 fn extend_data_dirs() {
     let home = std::env::var("HOME").unwrap_or_default();
     let current = std::env::var("XDG_DATA_DIRS")
@@ -298,7 +303,11 @@ thread_local! {
 }
 
 fn cached_apps() -> Rc<Vec<AppInfo>> {
-    APP_CACHE.with(|c| c.borrow_mut().get_or_insert_with(|| Rc::new(load_apps())).clone())
+    APP_CACHE.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| Rc::new(load_apps()))
+            .clone()
+    })
 }
 
 fn seed_app_cache(apps: Rc<Vec<AppInfo>>) {
@@ -417,7 +426,11 @@ impl Matcher {
 
     fn relevant(&self, t: &[char]) -> Option<i32> {
         let s = self.score(t)?;
-        if s >= 14 * self.qn { Some(s) } else { None }
+        if s >= 14 * self.qn {
+            Some(s)
+        } else {
+            None
+        }
     }
 }
 
@@ -469,7 +482,6 @@ fn niri_open_app_ids() -> Option<HashSet<String>> {
     Some(set)
 }
 
-
 fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
     std::thread::spawn(move || {
         let mut last_save = std::time::Instant::now();
@@ -512,7 +524,11 @@ fn spawn_tracker(resolver: HashMap<String, String>, usage: UsageMap) {
             };
 
             if let Some(slots) = snapshot {
-                save_usage(&Usage { slots, alive: HashMap::new(), dirty: false });
+                save_usage(&Usage {
+                    slots,
+                    alive: HashMap::new(),
+                    dirty: false,
+                });
                 last_save = Instant::now();
             }
         }
@@ -564,7 +580,8 @@ fn watch_input_device(
                                 st.clean.store(true, Ordering::SeqCst);
                             }
                             0 => {
-                                if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst) {
+                                if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst)
+                                {
                                     let _ = tx.send_blocking(());
                                 }
                                 st.down.store(false, Ordering::SeqCst);
@@ -643,7 +660,14 @@ fn spawn_super_watchers(tx: Sender<()>) {
                     w.insert(path.clone());
                 }
                 if is_keyboard || is_pointer {
-                    watch_input_device(path, dev, is_keyboard, tx.clone(), state.clone(), watched.clone());
+                    watch_input_device(
+                        path,
+                        dev,
+                        is_keyboard,
+                        tx.clone(),
+                        state.clone(),
+                        watched.clone(),
+                    );
                 }
             }
         }
@@ -669,9 +693,92 @@ fn make_app_button(info: AppInfo, window: &ApplicationWindow) -> Button {
     button.set_halign(gtk4::Align::Center);
     button.set_tooltip_text(Some(&info.display_name()));
 
+    attach_desktop_drag(&button, &info, &image, window);
+
     let win = window.clone();
     button.connect_clicked(move |b| launch_animated(&info, b, &win));
     button
+}
+
+fn desktop_file_path(info: &AppInfo) -> Option<PathBuf> {
+    let id = info.id()?.to_string();
+    let rel_flat = format!("applications/{id}");
+    let rel_nested = format!("applications/{}", id.replacen('-', "/", 1));
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let user = std::env::var("XDG_DATA_HOME")
+        .unwrap_or_else(|_| format!("{home}/.local/share"));
+    let sys = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+
+    std::iter::once(user)
+        .chain(sys.split(':').filter(|d| !d.is_empty()).map(String::from))
+        .flat_map(|d| {
+            let base = PathBuf::from(d);
+            [base.join(&rel_flat), base.join(&rel_nested)]
+        })
+        .find(|p| p.is_file())
+}
+
+fn attach_desktop_drag(button: &Button, info: &AppInfo, image: &Image, window: &ApplicationWindow) {
+    let src = gtk4::DragSource::new();
+    src.set_actions(gtk4::gdk::DragAction::COPY);
+
+    {
+        let info = info.clone();
+        src.connect_prepare(move |_, _, _| {
+            let file = gio::File::for_path(desktop_file_path(&info)?);
+            Some(gtk4::gdk::ContentProvider::for_value(&file.to_value()))
+        });
+    }
+
+    {
+        let image = image.clone();
+        let win = window.clone();
+        src.connect_drag_begin(move |_, drag| {
+            let paintable = gtk4::WidgetPaintable::new(Some(&image));
+            gtk4::DragIcon::for_drag(drag).set_child(Some(&Image::from_paintable(Some(&paintable))));
+            set_launcher_ghost(&win, true);
+        });
+    }
+
+    {
+        let win = window.clone();
+        src.connect_drag_end(move |_, _, _| {
+            win.set_visible(false);
+            set_launcher_ghost(&win, false);
+        });
+    }
+
+    button.add_controller(src);
+}
+
+fn set_launcher_ghost(window: &ApplicationWindow, on: bool) {
+    if let Some(app) = window.application() {
+        for w in app.windows() {
+            if let Ok(w) = w.downcast::<ApplicationWindow>() {
+                if w != *window && w.title().as_deref() == Some("altbd") {
+                    w.set_visible(false);
+                }
+            }
+        }
+    }
+
+    window.set_opacity(if on { 0.0 } else { 1.0 });
+    window.set_layer(if on { Layer::Background } else { Layer::Overlay });
+    if let Some(surface) = window.surface() {
+        let region = if on {
+            gtk4::cairo::Region::create()
+        } else {
+            gtk4::cairo::Region::create_rectangle(&gtk4::cairo::RectangleInt::new(
+                0,
+                0,
+                surface.width(),
+                surface.height(),
+            ))
+        };
+        surface.set_input_region(Some(&region));
+    }
 }
 
 fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
@@ -701,7 +808,8 @@ fn user_systemd_available() -> bool {
 fn spawn_survivor(argv: &[String], cwd: Option<PathBuf>) -> std::io::Result<()> {
     let mut cmd = if user_systemd_available() {
         let mut c = Command::new("systemd-run");
-        c.args(["--user", "--scope", "--collect", "--quiet", "--"]).args(argv);
+        c.args(["--user", "--scope", "--collect", "--quiet", "--"])
+            .args(argv);
         c
     } else {
         let mut c = Command::new(&argv[0]);
@@ -711,7 +819,9 @@ fn spawn_survivor(argv: &[String], cwd: Option<PathBuf>) -> std::io::Result<()> 
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     spawn_detached(&mut cmd)
 }
 
@@ -727,7 +837,11 @@ fn in_path(bin: &str) -> bool {
 }
 
 fn installed_terminals() -> Vec<&'static str> {
-    TERMINALS.iter().map(|(n, _)| *n).filter(|n| in_path(n)).collect()
+    TERMINALS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| in_path(n))
+        .collect()
 }
 
 fn desktop_keyfile(info: &AppInfo) -> Option<glib::KeyFile> {
@@ -959,7 +1073,10 @@ fn show_picker(window: &ApplicationWindow, title: &str, options: Vec<PickOpt>) {
 
     let mut first: Option<Button> = None;
     for (i, opt) in options.into_iter().enumerate() {
-        let row = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).build();
+        let row = GtkBox::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .spacing(10)
+            .build();
         if let Some(icon) = &opt.icon {
             let img = Image::from_gicon(icon);
             img.set_pixel_size(22);
@@ -996,7 +1113,12 @@ fn show_picker(window: &ApplicationWindow, title: &str, options: Vec<PickOpt>) {
     }
 }
 
-fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, terms: Vec<&'static str>) {
+fn ask_terminal(
+    info: &AppInfo,
+    source: &Button,
+    window: &ApplicationWindow,
+    terms: Vec<&'static str>,
+) {
     if window.child().and_downcast::<Overlay>().is_none() {
         start_launch(info, source, window, terms.first().copied());
         return;
@@ -1012,21 +1134,40 @@ fn ask_terminal(info: &AppInfo, source: &Button, window: &ApplicationWindow, ter
             }
         })
         .collect();
-    show_picker(window, &format!("Open {} with", info.display_name()), options);
+    show_picker(
+        window,
+        &format!("Open {} with", info.display_name()),
+        options,
+    );
 }
 
-fn launch_file(info: &AppInfo, term: Option<&'static str>, path: &Path, window: &ApplicationWindow) {
+fn launch_file(
+    info: &AppInfo,
+    term: Option<&'static str>,
+    path: &Path,
+    window: &ApplicationWindow,
+) {
     if desktop_needs_show() {
         let (info, path) = (info.clone(), path.to_path_buf());
         show_desktop_then(window, move || {
             if let Err(e) = run_app(&info, term, Some(&path)) {
-                eprintln!("Failed to open {} with {}: {}", path.display(), info.display_name(), e);
+                eprintln!(
+                    "Failed to open {} with {}: {}",
+                    path.display(),
+                    info.display_name(),
+                    e
+                );
             }
         });
         return;
     }
     if let Err(e) = run_app(info, term, Some(path)) {
-        eprintln!("Failed to open {} with {}: {}", path.display(), info.display_name(), e);
+        eprintln!(
+            "Failed to open {} with {}: {}",
+            path.display(),
+            info.display_name(),
+            e
+        );
     }
     window.set_visible(false);
 }
@@ -1105,7 +1246,11 @@ fn find_code_editors() -> Vec<AppInfo> {
 fn open_file_dialog(window: &ApplicationWindow, path: &Path) {
     let file = gio::File::for_path(path);
     let ctype = file
-        .query_info("standard::content-type", gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+        .query_info(
+            "standard::content-type",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
         .ok()
         .and_then(|i| i.content_type())
         .map(|c| c.to_string());
@@ -1164,7 +1309,10 @@ fn open_file_dialog(window: &ApplicationWindow, path: &Path) {
                     }
                 })
                 .collect();
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             show_picker(window, &format!("Open {name} with"), options);
         }
     }
@@ -1217,7 +1365,12 @@ fn launch_after_desktop(window: &ApplicationWindow, info: AppInfo, term: Option<
     });
 }
 
-fn start_launch(info: &AppInfo, source: &Button, window: &ApplicationWindow, term: Option<&'static str>) {
+fn start_launch(
+    info: &AppInfo,
+    source: &Button,
+    window: &ApplicationWindow,
+    term: Option<&'static str>,
+) {
     let Some(overlay) = window.child().and_downcast::<Overlay>() else {
         let _ = run_app(info, term, None);
         window.set_visible(false);
@@ -1541,7 +1694,6 @@ fn show_results(suggbox: &GtkBox, window: &ApplicationWindow, query: &str) {
     suggbox.append(&row);
 }
 
-
 // ───────────────────── mode panel: Files / Calc / Clipboard / Pills ─────────────────────
 
 fn copy_text(text: &str) {
@@ -1602,7 +1754,10 @@ impl Xf {
     }
 
     fn neg(self) -> Xf {
-        Xf { m: -self.m, e: self.e }
+        Xf {
+            m: -self.m,
+            e: self.e,
+        }
     }
 
     fn add(self, b: Xf) -> Option<Xf> {
@@ -1621,7 +1776,11 @@ impl Xf {
         }
         let (hi, lo) = if d >= 0 { (self, b) } else { (b, self) };
         let k = (hi.e - lo.e) as i32;
-        Xf { m: hi.m + lo.m * 10f64.powi(-k), e: hi.e }.norm()
+        Xf {
+            m: hi.m + lo.m * 10f64.powi(-k),
+            e: hi.e,
+        }
+        .norm()
     }
 
     fn sub(self, b: Xf) -> Option<Xf> {
@@ -1629,14 +1788,22 @@ impl Xf {
     }
 
     fn mul(self, b: Xf) -> Option<Xf> {
-        Xf { m: self.m * b.m, e: self.e + b.e }.norm()
+        Xf {
+            m: self.m * b.m,
+            e: self.e + b.e,
+        }
+        .norm()
     }
 
     fn div(self, b: Xf) -> Option<Xf> {
         if b.m == 0.0 {
             return None;
         }
-        Xf { m: self.m / b.m, e: self.e - b.e }.norm()
+        Xf {
+            m: self.m / b.m,
+            e: self.e - b.e,
+        }
+        .norm()
     }
 
     fn log10abs(self) -> Option<f64> {
@@ -1651,7 +1818,11 @@ impl Xf {
             return None;
         }
         let e = l.floor();
-        Xf { m: 10f64.powf(l - e), e: e as i64 }.norm()
+        Xf {
+            m: 10f64.powf(l - e),
+            e: e as i64,
+        }
+        .norm()
     }
 
     fn pow(self, b: Xf) -> Option<Xf> {
@@ -1684,9 +1855,17 @@ impl Xf {
             return Some(Xf::ZERO);
         }
         if self.e % 2 == 0 {
-            Xf { m: self.m.sqrt(), e: self.e / 2 }.norm()
+            Xf {
+                m: self.m.sqrt(),
+                e: self.e / 2,
+            }
+            .norm()
         } else {
-            Xf { m: (self.m * 10.0).sqrt(), e: (self.e - 1) / 2 }.norm()
+            Xf {
+                m: (self.m * 10.0).sqrt(),
+                e: (self.e - 1) / 2,
+            }
+            .norm()
         }
     }
 }
@@ -1694,7 +1873,10 @@ impl Xf {
 fn apply_fn(name: &str, a: Xf) -> Option<Xf> {
     match name {
         "sqrt" => a.sqrt(),
-        "abs" => Some(Xf { m: a.m.abs(), e: a.e }),
+        "abs" => Some(Xf {
+            m: a.m.abs(),
+            e: a.e,
+        }),
         "ln" => {
             if a.m <= 0.0 {
                 return None;
@@ -1834,7 +2016,9 @@ impl CalcParser {
         }
         if c.is_ascii_digit() || c == '.' {
             let st = self.i;
-            while self.i < self.s.len() && (self.s[self.i].is_ascii_digit() || self.s[self.i] == '.') {
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_digit() || self.s[self.i] == '.')
+            {
                 self.i += 1;
             }
             let t: String = self.s[st..self.i].iter().collect();
@@ -1900,11 +2084,16 @@ fn calc(q: &str) -> Option<String> {
     let mut q = q.trim().trim_start_matches('=').trim_start();
     if let Some(rest) = q.strip_prefix(|c: char| c == 'c' || c == 'C') {
         let t = rest.trim_start();
-        if matches!(t.chars().next(), Some(ch) if ch.is_ascii_digit() || matches!(ch, '(' | '.' | '-' | '+')) {
+        if matches!(t.chars().next(), Some(ch) if ch.is_ascii_digit() || matches!(ch, '(' | '.' | '-' | '+'))
+        {
             q = t;
         }
     }
-    let mut p = CalcParser { s: q.chars().collect(), i: 0, ops: 0 };
+    let mut p = CalcParser {
+        s: q.chars().collect(),
+        i: 0,
+        ops: 0,
+    };
     let v = p.expr()?;
     if p.peek().is_some() || p.ops == 0 {
         return None;
@@ -1966,7 +2155,10 @@ fn build_file_index() -> FileIndex {
             });
         }
     }
-    FileIndex { ents, built: Instant::now() }
+    FileIndex {
+        ents,
+        built: Instant::now(),
+    }
 }
 
 fn refresh_file_index(force: bool) {
@@ -2016,10 +2208,10 @@ fn expand_tilde(q: &str) -> PathBuf {
     PathBuf::from(q)
 }
 
-fn path_completion(q: &str, p: &Path) -> Option<String> {
+fn path_display(p: &Path, tilde: bool) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let s = p.to_string_lossy().to_string();
-    let mut disp = if q.starts_with('~') && !home.is_empty() && s.starts_with(&home) {
+    let mut disp = if tilde && !home.is_empty() && s.starts_with(&home) {
         format!("~{}", &s[home.len()..])
     } else {
         s
@@ -2027,7 +2219,14 @@ fn path_completion(q: &str, p: &Path) -> Option<String> {
     if p.is_dir() && !disp.ends_with('/') {
         disp.push('/');
     }
-    if disp.to_lowercase().starts_with(&q.to_lowercase()) && disp.chars().count() > q.chars().count() {
+    disp
+}
+
+fn path_completion(q: &str, p: &Path) -> Option<String> {
+    let disp = path_display(p, q.starts_with('~'));
+    if disp.to_lowercase().starts_with(&q.to_lowercase())
+        && disp.chars().count() > q.chars().count()
+    {
         Some(disp)
     } else {
         None
@@ -2045,7 +2244,10 @@ fn search_path(q: &str, generation: &AtomicU64, mine: u64) -> Vec<PathBuf> {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let dir = full.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
+        let dir = full
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/"));
         (dir, prefix)
     };
 
@@ -2231,7 +2433,10 @@ impl Cat {
 }
 
 fn pretty_dir(p: &std::path::Path) -> String {
-    let dir = p.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+    let dir = p
+        .parent()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_default();
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() && dir.starts_with(&home) {
         format!("~{}", &dir[home.len()..])
@@ -2247,9 +2452,17 @@ fn file_hits(paths: Vec<PathBuf>, window: &ApplicationWindow) -> Vec<Hit> {
             let win = window.clone();
             let target = p.clone();
             Hit {
-                title: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                title: p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
                 subtitle: pretty_dir(&p),
-                icon: if p.is_dir() { "folder" } else { "text-x-generic" }.to_string(),
+                icon: if p.is_dir() {
+                    "folder"
+                } else {
+                    "text-x-generic"
+                }
+                .to_string(),
                 thumb: None,
                 clip_line: None,
                 path: Some(p.clone()),
@@ -2366,7 +2579,8 @@ fn clip_cache_clear() {
     }
 }
 
-static CLIP_THUMBS: std::sync::OnceLock<Mutex<HashMap<u64, ThumbPixels>>> = std::sync::OnceLock::new();
+static CLIP_THUMBS: std::sync::OnceLock<Mutex<HashMap<u64, ThumbPixels>>> =
+    std::sync::OnceLock::new();
 
 fn ensure_cliphist_watchers() {
     if !CLIP_ENABLED {
@@ -2418,7 +2632,12 @@ fn cliphist_list() -> std::io::Result<Vec<ClipEntry>> {
                 prev.to_string()
             })
             .to_lowercase();
-            Some(ClipEntry { id, prev: prev.to_string(), line: l.to_string(), hay })
+            Some(ClipEntry {
+                id,
+                prev: prev.to_string(),
+                line: l.to_string(),
+                hay,
+            })
         })
         .collect())
 }
@@ -2459,7 +2678,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(v);
                 i += 3;
                 continue;
@@ -2490,7 +2711,10 @@ fn parse_file_uris(text: &str) -> Vec<PathBuf> {
 
 fn is_image_path(p: &Path) -> bool {
     matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tif" | "tiff")
     )
 }
@@ -2538,16 +2762,29 @@ fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
         let (title, subtitle) = if parts.len() >= 4 {
             (
                 format!("Image · {} {}", parts[2], parts[3]),
-                format!("{} {} · Enter to select · Del to delete", parts[0], parts[1]),
+                format!(
+                    "{} {} · Enter to select · Del to delete",
+                    parts[0], parts[1]
+                ),
             )
         } else {
-            ("Image".to_string(), format!("{info} · Enter to select · Del to delete"))
+            (
+                "Image".to_string(),
+                format!("{info} · Enter to select · Del to delete"),
+            )
         };
         let (thumb, job) = match clip_thumb_cached(id) {
             Some(t) => (Some(t), None),
             None => (None, Some(ThumbJob::Clip(id))),
         };
-        return ClipItem { line, kind: ClipKind::Image, title, subtitle, thumb, job };
+        return ClipItem {
+            line,
+            kind: ClipKind::Image,
+            title,
+            subtitle,
+            thumb,
+            job,
+        };
     }
 
     if looks_like_files(prev) {
@@ -2556,18 +2793,31 @@ fn build_clip_item(id: u64, prev: &str, line: String) -> ClipItem {
             .unwrap_or_else(|| prev.to_string());
         let paths = parse_file_uris(&full);
         if let Some(first) = paths.first() {
-            let name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = first
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             let (title, subtitle) = if paths.len() == 1 {
-                (name, format!("{} · Enter to select · Del to delete", pretty_dir(first)))
+                (
+                    name,
+                    format!("{} · Enter to select · Del to delete", pretty_dir(first)),
+                )
             } else {
                 (
                     format!("{name} +{} more", paths.len() - 1),
                     format!("{} files · {}", paths.len(), pretty_dir(first)),
                 )
             };
-            let job = (paths.len() == 1 && is_image_path(first))
-                .then(|| ThumbJob::File(first.clone()));
-            return ClipItem { line, kind: ClipKind::Files, title, subtitle, thumb: None, job };
+            let job =
+                (paths.len() == 1 && is_image_path(first)).then(|| ThumbJob::File(first.clone()));
+            return ClipItem {
+                line,
+                kind: ClipKind::Files,
+                title,
+                subtitle,
+                thumb: None,
+                job,
+            };
         }
     }
 
@@ -2599,7 +2849,10 @@ fn clear_clip() {
 
 fn is_clip_query(q: &str) -> bool {
     matches!(
-        q.split_whitespace().next().map(|w| w.to_lowercase()).as_deref(),
+        q.split_whitespace()
+            .next()
+            .map(|w| w.to_lowercase())
+            .as_deref(),
         Some("clip" | "clipboard")
     )
 }
@@ -2636,7 +2889,11 @@ fn search_clip(q: &str, generation: &AtomicU64, mine: u64) -> Result<Vec<ClipIte
         return Ok(Vec::new());
     }
     let list_all = is_clip_query(q);
-    let mut words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
+    let mut words: Vec<String> = q
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     if list_all {
         words.remove(0);
     }
@@ -2712,7 +2969,9 @@ fn restore_clip(line: &str) {
     std::thread::spawn(move || {
         use std::io::Write;
         use std::process::Stdio;
-        let Some(bytes) = cliphist_decode(&line) else { return };
+        let Some(bytes) = cliphist_decode(&line) else {
+            return;
+        };
         let mut cmd = Command::new("wl-copy");
         if let Some(m) = clip_mime(&bytes) {
             cmd.arg("--type").arg(m);
@@ -2860,7 +3119,10 @@ fn hit_button(hit: &Hit, window: &ApplicationWindow) -> Button {
     text.append(&title);
     text.append(&sub);
 
-    let row = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).build();
+    let row = GtkBox::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(12)
+        .build();
     row.append(&lead);
     row.append(&text);
 
@@ -2912,7 +3174,12 @@ fn help_text(t: &str) -> Label {
     l
 }
 
-fn help_row(glyph: &str, tile_class: &str, label: &str, content: &impl IsA<gtk4::Widget>) -> GtkBox {
+fn help_row(
+    glyph: &str,
+    tile_class: &str,
+    label: &str,
+    content: &impl IsA<gtk4::Widget>,
+) -> GtkBox {
     let tile = Label::new(Some(glyph));
     tile.add_css_class("help-tile");
     tile.add_css_class(tile_class);
@@ -2977,13 +3244,20 @@ fn calc_help() -> GtkBox {
     let rows: Vec<GtkBox> = vec![
         help_row("≈", "tile-teal", "Example", &example),
         help_row("c", "tile-blue", "Start with", &help_chips(&["c", "="])),
-        help_row("±", "tile-orange", "Operators", &help_chips(&["+", "-", "*", "/", "%", "^", "( )"])),
+        help_row(
+            "±",
+            "tile-orange",
+            "Operators",
+            &help_chips(&["+", "-", "*", "/", "%", "^", "( )"]),
+        ),
         help_row("π", "tile-purple", "Constants", &help_chips(&["pi", "e"])),
         help_row(
             "ƒ",
             "tile-green",
             "Functions",
-            &help_chips(&["sqrt", "sin", "cos", "tan", "ln", "log", "exp", "abs", "floor", "ceil", "round"]),
+            &help_chips(&[
+                "sqrt", "sin", "cos", "tan", "ln", "log", "exp", "abs", "floor", "ceil", "round",
+            ]),
         ),
     ];
 
@@ -3061,11 +3335,25 @@ fn clip_help() -> GtkBox {
         "Clipboard",
         "Type clip to browse everything you copied",
         vec![
-            help_row("⧉", "tile-blue", "Search", &help_chips(&["clip", "clipboard", "TEXT"])),
-            help_row("⌫", "tile-orange", "Delete", &help_text("Select an entry with ↑ ↓, then press Del")),
+            help_row(
+                "⧉",
+                "tile-blue",
+                "Search",
+                &help_chips(&["clip", "clipboard", "TEXT"]),
+            ),
+            help_row(
+                "⌫",
+                "tile-orange",
+                "Delete",
+                &help_text("Select an entry with ↑ ↓, then press Del"),
+            ),
             help_row("✕", "tile-red", "Clear all", &clear),
-            help_row("↵", "tile-green", "Enter", &help_text("Selects in clipboard: text, images and files")),
-            help_row("i", "tile-gray", "Dependencies", &help_chips(&["cliphist", "wl-clipboard"])),
+            help_row(
+                "↵",
+                "tile-green",
+                "Enter",
+                &help_text("Selects in clipboard: text, images and files"),
+            ),
         ],
     )
 }
@@ -3127,7 +3415,11 @@ fn looks_like_text(p: &Path) -> bool {
     if buf.contains(&0) {
         return false;
     }
-    String::from_utf8_lossy(&buf).chars().filter(|c| *c == '\u{FFFD}').count() <= 2
+    String::from_utf8_lossy(&buf)
+        .chars()
+        .filter(|c| *c == '\u{FFFD}')
+        .count()
+        <= 2
 }
 
 fn preview_kind(p: &Path) -> PreviewKind {
@@ -3136,10 +3428,11 @@ fn preview_kind(p: &Path) -> PreviewKind {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "ico" | "avif" => {
-            PreviewKind::Image
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "ico"
+        | "avif" => PreviewKind::Image,
+        "mp3" | "wav" | "ogg" | "oga" | "flac" | "m4a" | "aac" | "opus" | "wma" => {
+            PreviewKind::Audio
         }
-        "mp3" | "wav" | "ogg" | "oga" | "flac" | "m4a" | "aac" | "opus" | "wma" => PreviewKind::Audio,
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "ogv" => PreviewKind::Video,
         "pdf" => PreviewKind::Pdf,
         _ => {
@@ -3173,7 +3466,10 @@ fn read_text_preview(p: &Path) -> String {
         return "Can't read this file".to_string();
     };
     let mut buf = Vec::with_capacity(PREVIEW_TEXT_BYTES);
-    if f.take(PREVIEW_TEXT_BYTES as u64 + 1).read_to_end(&mut buf).is_err() {
+    if f.take(PREVIEW_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
         return "Can't read this file".to_string();
     }
     let truncated = buf.len() > PREVIEW_TEXT_BYTES;
@@ -3495,33 +3791,38 @@ impl PreviewPane {
 
         let kind = preview_kind(path);
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        self.meta.set_text(&format!("{} · {}", kind.label(), human_size(size)));
+        self.meta
+            .set_text(&format!("{} · {}", kind.label(), human_size(size)));
         self.root.set_visible(true);
 
         let p = path.to_path_buf();
         match kind {
             PreviewKind::Text => {
                 self.set_content(self.message("Loading…").upcast_ref());
-                self.spawn_load(id, move || read_text_preview(&p), |me, text| {
-                    let tv = TextView::builder()
-                        .editable(false)
-                        .cursor_visible(false)
-                        .wrap_mode(WrapMode::WordChar)
-                        .left_margin(8)
-                        .right_margin(8)
-                        .top_margin(6)
-                        .bottom_margin(6)
-                        .focusable(false)
-                        .css_classes(["preview-text"])
-                        .build();
-                    tv.buffer().set_text(&text);
-                    let sw = ScrolledWindow::builder()
-                        .hscrollbar_policy(gtk4::PolicyType::Never)
-                        .focusable(false)
-                        .child(&tv)
-                        .build();
-                    me.set_content(sw.upcast_ref());
-                });
+                self.spawn_load(
+                    id,
+                    move || read_text_preview(&p),
+                    |me, text| {
+                        let tv = TextView::builder()
+                            .editable(false)
+                            .cursor_visible(false)
+                            .wrap_mode(WrapMode::WordChar)
+                            .left_margin(8)
+                            .right_margin(8)
+                            .top_margin(6)
+                            .bottom_margin(6)
+                            .focusable(false)
+                            .css_classes(["preview-text"])
+                            .build();
+                        tv.buffer().set_text(&text);
+                        let sw = ScrolledWindow::builder()
+                            .hscrollbar_policy(gtk4::PolicyType::Never)
+                            .focusable(false)
+                            .child(&tv)
+                            .build();
+                        me.set_content(sw.upcast_ref());
+                    },
+                );
             }
             PreviewKind::Image => {
                 self.set_content(self.message("Loading…").upcast_ref());
@@ -3533,10 +3834,14 @@ impl PreviewPane {
             }
             PreviewKind::Pdf => {
                 self.set_content(self.message("Rendering…").upcast_ref());
-                self.spawn_load(id, move || render_pdf_first_page(&p, id), |me, res| match res {
-                    Ok(px) => me.show_thumb(Some(px), ""),
-                    Err(msg) => me.set_content(me.message(&msg).upcast_ref()),
-                });
+                self.spawn_load(
+                    id,
+                    move || render_pdf_first_page(&p, id),
+                    |me, res| match res {
+                        Ok(px) => me.show_thumb(Some(px), ""),
+                        Err(msg) => me.set_content(me.message(&msg).upcast_ref()),
+                    },
+                );
             }
             PreviewKind::Video => {
                 self.set_content(self.message("Loading…").upcast_ref());
@@ -3658,7 +3963,8 @@ impl ModePanel {
             .build();
 
         let mut tabs: Vec<(&'static str, Button)> = Vec::new();
-        let labels = std::iter::once(("home", "Top Results")).chain(Cat::ALL.iter().map(|c| (c.id(), c.title())));
+        let labels = std::iter::once(("home", "Top Results"))
+            .chain(Cat::ALL.iter().map(|c| (c.id(), c.title())));
         for (id, label) in labels {
             let b = Button::with_label(label);
             b.add_css_class("flat");
@@ -3679,7 +3985,9 @@ impl ModePanel {
 
         let preview = PreviewPane::new();
         scroller.set_hexpand(true);
-        let body = GtkBox::builder().orientation(gtk4::Orientation::Horizontal).build();
+        let body = GtkBox::builder()
+            .orientation(gtk4::Orientation::Horizontal)
+            .build();
         body.append(&scroller);
         body.append(&preview.root);
 
@@ -3737,10 +4045,17 @@ impl ModePanel {
     }
 
     fn visible_hits(&self) -> Vec<Hit> {
-        let name = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let name = self
+            .stack
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let res = self.results.borrow();
         if name.is_empty() || name == "home" {
-            Cat::HOME.iter().filter_map(|c| res[c.idx()].first().cloned()).collect()
+            Cat::HOME
+                .iter()
+                .filter_map(|c| res[c.idx()].first().cloned())
+                .collect()
         } else {
             Cat::ALL
                 .iter()
@@ -3751,7 +4066,11 @@ impl ModePanel {
     }
 
     fn visible_rows(&self) -> Vec<gtk4::Widget> {
-        let name = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let name = self
+            .stack
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let page = match Cat::ALL.iter().position(|c| c.id() == name) {
             Some(i) => self.pages[i].clone(),
             None => self.home.clone(),
@@ -3786,7 +4105,12 @@ impl ModePanel {
             self.focused.set(false);
         }
         let cur = if self.focused.get() {
-            Some(self.sel.get().unwrap_or(0).min(rows.len().saturating_sub(1)))
+            Some(
+                self.sel
+                    .get()
+                    .unwrap_or(0)
+                    .min(rows.len().saturating_sub(1)),
+            )
         } else {
             None
         };
@@ -3811,7 +4135,10 @@ impl ModePanel {
     }
 
     fn update_preview(&self) {
-        let on_files = self.stack.visible_child_name().map_or(false, |n| n == "files");
+        let on_files = self
+            .stack
+            .visible_child_name()
+            .map_or(false, |n| n == "files");
         let path = if on_files && self.focused.get() {
             self.visible_hits()
                 .get(self.sel.get().unwrap_or(0))
@@ -3823,6 +4150,8 @@ impl ModePanel {
             Some(p) if p.is_file() => self.preview.show(&p),
             _ => self.preview.clear(),
         }
+        let typed = self.entry.text().to_string();
+        self.update_ghost(&typed);
     }
 
     fn focus_apps(&self) {
@@ -3858,11 +4187,17 @@ impl ModePanel {
     }
 
     fn is_home(&self) -> bool {
-        self.stack.visible_child_name().map_or(true, |n| n == "home")
+        self.stack
+            .visible_child_name()
+            .map_or(true, |n| n == "home")
     }
 
     fn next_page(&self, delta: i32) {
-        let cur = self.stack.visible_child_name().map(|n| n.to_string()).unwrap_or_default();
+        let cur = self
+            .stack
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let i = self.tabs.iter().position(|(id, _)| *id == cur).unwrap_or(0) as i32;
         let n = (i + delta).rem_euclid(self.tabs.len() as i32) as usize;
         self.select(self.tabs[n].0);
@@ -3871,6 +4206,8 @@ impl ModePanel {
     fn clear_ghost(&self) {
         self.ghost.set_visible(false);
         self.ghost.set_text("");
+        self.ghost.remove_css_class("full");
+        self.entry.remove_css_class("ghosting");
         *self.ghost_full.borrow_mut() = None;
     }
 
@@ -3887,6 +4224,29 @@ impl ModePanel {
 
     fn update_ghost(&self, q: &str) {
         let typed = self.entry.text().to_string();
+
+        let on_files = self
+            .stack
+            .visible_child_name()
+            .map_or(false, |n| n == "files");
+        if on_files && self.focused.get() {
+            let sel = self
+                .visible_hits()
+                .get(self.sel.get().unwrap_or(0))
+                .and_then(|h| h.path.clone());
+            if let Some(p) = sel {
+                let full = path_display(&p, true);
+                self.ghost.set_markup(&glib::markup_escape_text(&full));
+                self.ghost.add_css_class("full");
+                self.ghost.set_visible(true);
+                self.entry.add_css_class("ghosting");
+                *self.ghost_full.borrow_mut() = Some(full);
+                return;
+            }
+        }
+        self.ghost.remove_css_class("full");
+        self.entry.remove_css_class("ghosting");
+
         let full = if is_path_query(q) && typed == q {
             self.results.borrow()[Cat::Files.idx()]
                 .first()
@@ -3929,7 +4289,11 @@ impl ModePanel {
         self.sel.set(None);
 
         if is_clip_query(&q)
-            && self.stack.visible_child_name().map(|n| n.as_str() != "clip").unwrap_or(true)
+            && self
+                .stack
+                .visible_child_name()
+                .map(|n| n.as_str() != "clip")
+                .unwrap_or(true)
         {
             self.select("clip");
         }
@@ -3960,8 +4324,8 @@ impl ModePanel {
                 if let Ok(paths) = rx.recv().await {
                     if panel.generation.load(Ordering::SeqCst) == mine {
                         let hits = file_hits(paths, &panel.window);
-                        let unchanged = hits.is_empty()
-                            && panel.results.borrow()[Cat::Files.idx()].is_empty();
+                        let unchanged =
+                            hits.is_empty() && panel.results.borrow()[Cat::Files.idx()].is_empty();
                         if !unchanged {
                             panel.results.borrow_mut()[Cat::Files.idx()] = hits;
                             panel.render_cats(&[Cat::Files]);
@@ -4009,7 +4373,10 @@ impl ModePanel {
                             batch.push((line, t));
                         }
                         if !batch.is_empty() && last.elapsed() >= Duration::from_millis(200) {
-                            if tx.send_blocking(ClipMsg::Thumbs(std::mem::take(&mut batch))).is_err() {
+                            if tx
+                                .send_blocking(ClipMsg::Thumbs(std::mem::take(&mut batch)))
+                                .is_err()
+                            {
                                 return;
                             }
                             last = Instant::now();
@@ -4039,7 +4406,6 @@ impl ModePanel {
                 }
             });
         }
-
     }
 
     fn apply_thumbs(&self, batch: Vec<(String, ThumbPixels)>) {
@@ -4261,7 +4627,13 @@ fn build_window(
     app: &Application,
     usage: &UsageMap,
     _apps: Rc<Vec<AppInfo>>,
-) -> (ApplicationWindow, ApplicationWindow, FlowBox, GtkBox, SearchUi) {
+) -> (
+    ApplicationWindow,
+    ApplicationWindow,
+    FlowBox,
+    GtkBox,
+    SearchUi,
+) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("alt.")
@@ -4400,7 +4772,6 @@ fn build_window(
     allappstitle.set_hexpand(true);
     allappstitle.set_css_classes(&["pagetitle"]);
 
-
     let card = GtkBox::builder()
         .orientation(gtk4::Orientation::Vertical)
         .css_classes(["win-card"])
@@ -4420,7 +4791,14 @@ fn build_window(
     card.append(&mode_panel);
 
     let display = Display::default().expect("no display");
-    let panel = ModePanel::new(&window, &mode_panel, &display, &suggestionbox, &search_entry, &ghost_label);
+    let panel = ModePanel::new(
+        &window,
+        &mode_panel,
+        &display,
+        &suggestionbox,
+        &search_entry,
+        &ghost_label,
+    );
 
     let search = SearchUi {
         entry: search_entry,
@@ -4478,7 +4856,11 @@ fn build_window(
                 return glib::Propagation::Stop;
             }
             if ui.active() && (key == gtk4::gdk::Key::Tab || key == gtk4::gdk::Key::ISO_Left_Tab) {
-                ui.panel.next_page(if key == gtk4::gdk::Key::ISO_Left_Tab { -1 } else { 1 });
+                ui.panel.next_page(if key == gtk4::gdk::Key::ISO_Left_Tab {
+                    -1
+                } else {
+                    1
+                });
                 return glib::Propagation::Stop;
             }
             if ui.active() {
@@ -4492,10 +4874,10 @@ fn build_window(
                         return glib::Propagation::Stop;
                     }
                     gtk4::gdk::Key::Alt_L | gtk4::gdk::Key::Alt_R => {
-                        if !ui.panel.mode_focused() {
-                            if ui.panel.accept_completion() {
-                                return glib::Propagation::Stop;
-                            }
+                        if ui.panel.accept_completion() {
+                            ui.entry.grab_focus();
+                            ui.entry.set_position(-1);
+                            return glib::Propagation::Stop;
                         }
                     }
                     gtk4::gdk::Key::Delete | gtk4::gdk::Key::KP_Delete => {
@@ -4593,7 +4975,11 @@ fn build_window(
             {
                 let ui = ui.clone();
                 let qg = query_generation.clone();
-                let mode_delay = if is_path_query(&q) { FAST_DEBOUNCE_MS } else { MODE_DEBOUNCE_MS };
+                let mode_delay = if is_path_query(&q) {
+                    FAST_DEBOUNCE_MS
+                } else {
+                    MODE_DEBOUNCE_MS
+                };
                 glib::timeout_add_local_once(Duration::from_millis(mode_delay), move || {
                     if qg.get() != generation || !ui.active() {
                         return;
@@ -4685,31 +5071,25 @@ fn build_window(
             background-color: rgba(255, 255, 255, 0.06);
         }
 
-        scrollbar {
+        flowboxchild {
             all: unset;
-            background-color: transparent;    
         }
 
-        scrollbar trough {
-            background-color: transparent; 
+        
+        scrollbar,
+        scrollbar > range > trough,
+        scrollbar > range > trough > slider {
+            opacity: 0;
+            min-width: 0;
+            min-height: 0;
+            margin: 0;
+            padding: 0;
+            border: none;
+            background: none;
+            box-shadow: none;
+            outline: none;
         }
 
-        scrollbar trough:hover {
-            background-color: rgba(0, 0, 0, 0);
-        }
-
-        scrollbar range {
-            background-color: transparent;
-        }
-
-        scrollbar slider {
-            background-color: transparent;
-            border: 2px solid transparent;
-        }
-
-        scrollbar slider:hover {
-            background-color: transparent;
-        }
 
         .winheader {
             padding: 0 0 5px 0;
@@ -4756,6 +5136,14 @@ fn build_window(
             font-size: 16px;
             color: rgba(253, 253, 253, 0.2);
             padding: 0;
+        }
+
+        label.search-ghost.full {
+            color: rgba(253, 253, 253, 0.45);
+        }
+
+        entry.search-entry.ghosting {
+            color: transparent;
         }
 
         .sugg-name {
@@ -4862,7 +5250,7 @@ fn build_window(
         .help-tile {
             min-width: 26px;
             min-height: 26px;
-            border-radius: 50px;
+            border-radius: 11px;
             font-size: 14px;
             font-weight: 700;
             color: white;
@@ -5002,8 +5390,8 @@ fn ensure_writable(path: &str) -> Result<(), String> {
     }
 
     if let Some(parent) = path_obj.parent() {
-        let c_parent = CString::new(parent.to_string_lossy().to_string())
-            .map_err(|e| e.to_string())?;
+        let c_parent =
+            CString::new(parent.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
         let dir_writable = unsafe { libc::access(c_parent.as_ptr(), libc::W_OK) == 0 };
         if !dir_writable {
             return Err(format!(
@@ -5063,14 +5451,13 @@ fn main() -> glib::ExitCode {
     extend_data_dirs();
 
     let args: Vec<String> = std::env::args().collect();
-    
+
     if args.len() > 1 && (args[1] == "--version" || args[1] == "-V") {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         exit(1);
     } else if args.len() > 1 && (args[1] == "--update" || args[1] == "-U") {
         exit(run_update());
     }
-
 
     let app = Application::builder()
         .application_id("ekah.scu.alt")
