@@ -720,7 +720,50 @@ fn desktop_file_path(info: &AppInfo) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+thread_local! {
+    static DRAG_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static DRAG_LEFT: Cell<bool> = const { Cell::new(false) };
+    static LEAVE_WATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+fn drag_left_launcher(window: &ApplicationWindow) {
+    if !DRAG_ACTIVE.get() || DRAG_LEFT.replace(true) {
+        return;
+    }
+
+    set_launcher_ghost(window, true);
+
+    std::thread::spawn(|| {
+        let mode = capsule_mode();
+        if mode.as_deref().map_or(false, |m| m.contains("appview")) {
+            signal_capsule();
+        }
+    });
+}
+
+fn install_drag_leave_watch(window: &ApplicationWindow) {
+    if LEAVE_WATCH.replace(true) {
+        return;
+    }
+    let motion = gtk4::DropControllerMotion::new();
+    {
+        let w = window.clone();
+        motion.connect_leave(move |_| drag_left_launcher(&w));
+    }
+    {
+        let w = window.clone();
+        motion.connect_motion(move |_, x, y| {
+            if x < 0.0 || y < 0.0 || x >= w.width() as f64 || y >= w.height() as f64 {
+                drag_left_launcher(&w);
+            }
+        });
+    }
+    window.add_controller(motion);
+}
+
 fn attach_desktop_drag(button: &Button, info: &AppInfo, image: &Image, window: &ApplicationWindow) {
+    install_drag_leave_watch(window);
+
     let src = gtk4::DragSource::new();
     src.set_actions(gtk4::gdk::DragAction::COPY);
 
@@ -737,14 +780,25 @@ fn attach_desktop_drag(button: &Button, info: &AppInfo, image: &Image, window: &
         let win = window.clone();
         src.connect_drag_begin(move |_, drag| {
             let paintable = gtk4::WidgetPaintable::new(Some(&image));
-            gtk4::DragIcon::for_drag(drag).set_child(Some(&Image::from_paintable(Some(&paintable))));
-            set_launcher_ghost(&win, true);
+            let icon_img = gtk4::Image::from_paintable(Some(&paintable));
+            icon_img.set_pixel_size(46);
+
+            if let Some(icon) = gtk4::DragIcon::for_drag(drag).downcast_ref::<gtk4::DragIcon>() {
+                icon.set_child(Some(&icon_img));
+            }
+
+            DRAG_ACTIVE.set(true);
+            DRAG_LEFT.set(false);
+            // Launcher stays visible until the pointer leaves it; only the backdrop goes now.
+            hide_backdrop(&win);
         });
     }
 
     {
         let win = window.clone();
         src.connect_drag_end(move |_, _, _| {
+            DRAG_ACTIVE.set(false);
+            DRAG_LEFT.set(false);
             win.set_visible(false);
             set_launcher_ghost(&win, false);
         });
@@ -753,7 +807,7 @@ fn attach_desktop_drag(button: &Button, info: &AppInfo, image: &Image, window: &
     button.add_controller(src);
 }
 
-fn set_launcher_ghost(window: &ApplicationWindow, on: bool) {
+fn hide_backdrop(window: &ApplicationWindow) {
     if let Some(app) = window.application() {
         for w in app.windows() {
             if let Ok(w) = w.downcast::<ApplicationWindow>() {
@@ -763,9 +817,13 @@ fn set_launcher_ghost(window: &ApplicationWindow, on: bool) {
             }
         }
     }
+}
+
+fn set_launcher_ghost(window: &ApplicationWindow, on: bool) {
+    hide_backdrop(window);
 
     window.set_opacity(if on { 0.0 } else { 1.0 });
-    window.set_layer(if on { Layer::Background } else { Layer::Overlay });
+    window.set_layer(if on { Layer::Bottom } else { Layer::Overlay });
     if let Some(surface) = window.surface() {
         let region = if on {
             gtk4::cairo::Region::create()
@@ -948,6 +1006,21 @@ fn capsule_state() -> Option<String> {
 
 fn desktop_needs_show() -> bool {
     capsule_state().as_deref() == Some("desktop")
+}
+
+fn capsule_mode() -> Option<String> {
+    let out = match Command::new("capsule").arg("-D").output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[altDot] failed to run `capsule -D: {e}");
+            return None;
+        }
+    };
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    }
+    Some(text.to_lowercase())
 }
 
 fn signal_capsule() {
@@ -5066,9 +5139,14 @@ fn build_window(
             padding: 12px;
             border-radius: 20px;
             border: none;
+            transition: all 400ms cubic-bezier(0.4, 0, 0.2, 1);
         }
         .app-btn:hover {
             background-color: rgba(255, 255, 255, 0.06);
+        }
+
+        .app-btn:active {
+            transform: scale(0.5);
         }
 
         flowboxchild {
