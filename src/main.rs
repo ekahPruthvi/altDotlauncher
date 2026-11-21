@@ -4,7 +4,7 @@ use gtk4::gio::{self, AppInfo};
 use gtk4::prelude::*;
 use gtk4::{
     glib, pango, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider,
-    Entry as GtkEntry, FlowBox, IconTheme, Image, Label, MediaFile, MediaStream, Overlay, Picture,
+    Entry as GtkEntry, FlowBox, IconTheme, Image, Label, Overlay, Picture,
     ScrolledWindow, SelectionMode, Stack, StackTransitionType, TextView, WrapMode,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -552,8 +552,6 @@ fn watch_input_device(
 
     let left = KeyCode::KEY_LEFTMETA.code();
     let right = KeyCode::KEY_RIGHTMETA.code();
-    let touch = KeyCode::BTN_TOUCH.0;
-    let finger = KeyCode::BTN_TOOL_FINGER.0;
     let wheel = [
         RelativeAxisCode::REL_WHEEL.0,
         RelativeAxisCode::REL_HWHEEL.0,
@@ -580,9 +578,16 @@ fn watch_input_device(
                                 st.clean.store(true, Ordering::SeqCst);
                             }
                             0 => {
+                                if std::env::var_os("ALTDOT_DEBUG").is_some() {
+                                    eprintln!(
+                                        "super release: down={} clean={}",
+                                        st.down.load(Ordering::SeqCst),
+                                        st.clean.load(Ordering::SeqCst)
+                                    );
+                                }
                                 if st.down.load(Ordering::SeqCst) && st.clean.load(Ordering::SeqCst)
                                 {
-                                    let _ = tx.send_blocking(());
+                                    let _ = tx.try_send(());
                                 }
                                 st.down.store(false, Ordering::SeqCst);
                             }
@@ -596,7 +601,7 @@ fn watch_input_device(
                         continue;
                     }
                     let taints = match ev.event_type() {
-                        EventType::KEY => value == 1 && code != touch && code != finger,
+                        EventType::KEY => value == 1 && (0x110..=0x117).contains(&code),
                         EventType::RELATIVE => wheel.contains(&code),
                         _ => false,
                     };
@@ -789,7 +794,6 @@ fn attach_desktop_drag(button: &Button, info: &AppInfo, image: &Image, window: &
 
             DRAG_ACTIVE.set(true);
             DRAG_LEFT.set(false);
-            // Launcher stays visible until the pointer leaves it; only the backdrop goes now.
             hide_backdrop(&win);
         });
     }
@@ -3617,11 +3621,131 @@ fn render_pdf_first_page(p: &Path, id: u64) -> Result<ThumbPixels, String> {
     res.ok_or_else(|| "Can't render this PDF".to_string())
 }
 
+fn render_video_thumb(p: &Path, id: u64) -> Result<ThumbPixels, String> {
+    let png = std::env::temp_dir().join(format!("altdot-vthumb-{}-{}.png", std::process::id(), id));
+    for seek in ["1", "0"] {
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-y", "-ss", seek, "-i"])
+            .arg(p)
+            .args(["-frames:v", "1", "-vf", "scale=712:-2"])
+            .arg(&png)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() && png.exists() => {
+                let res = load_cover(&png, PREVIEW_BOX_W, PREVIEW_BOX_H);
+                let _ = std::fs::remove_file(&png);
+                return res.ok_or_else(|| "Can't preview this video".to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err("Install ffmpeg to preview videos".to_string());
+            }
+            _ => {}
+        }
+    }
+    let _ = std::fs::remove_file(&png);
+    Err("Can't preview this video".to_string())
+}
+
+struct VideoHandle {
+    stop: Arc<AtomicBool>,
+    pid: Arc<AtomicI32>,
+    paused: Arc<AtomicBool>,
+    btn: glib::WeakRef<Button>,
+}
+
+impl VideoHandle {
+    fn toggle_pause(&self) {
+        let now = !self.paused.load(Ordering::SeqCst);
+        self.paused.store(now, Ordering::SeqCst);
+        if let Some(b) = self.btn.upgrade() {
+            b.set_label(if now { "▶" } else { "⏸" });
+        }
+    }
+
+    fn kill(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let p = self.pid.swap(-1, Ordering::SeqCst);
+        if p > 0 {
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn run_video_worker(
+    path: PathBuf,
+    w: i32,
+    h: i32,
+    tx: async_channel::Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    pid: Arc<AtomicI32>,
+) {
+    use std::io::Read;
+    lower_priority();
+    let vf = format!(
+        "scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps=24"
+    );
+    let spawned = Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-nostdin", "-threads", "2", "-re", "-stream_loop", "-1", "-i",
+        ])
+        .arg(&path)
+        .args(["-an", "-sn", "-vf"])
+        .arg(&vf)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return;
+    };
+    pid.store(child.id() as i32, Ordering::SeqCst);
+    if stop.load(Ordering::SeqCst) {
+        let p = pid.swap(-1, Ordering::SeqCst);
+        if p > 0 {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        return;
+    }
+    if let Some(mut out) = child.stdout.take() {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if paused.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+            if out.read_exact(&mut buf).is_err() {
+                break;
+            }
+            match tx.try_send(buf.clone()) {
+                Err(async_channel::TrySendError::Closed(_)) => break,
+                _ => {}
+            }
+        }
+    }
+    if pid.swap(-1, Ordering::SeqCst) > 0 {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 struct PreviewPane {
     root: GtkBox,
     meta: Label,
     content: GtkBox,
-    media: RefCell<Option<MediaStream>>,
+    video: RefCell<Option<VideoHandle>>,
+    kind: Cell<Option<PreviewKind>>,
+    audio_btn: RefCell<Option<Button>>,
     audio: RefCell<Option<(OutputStream, Sink)>>,
     current: RefCell<Option<PathBuf>>,
     gen: Cell<u64>,
@@ -3660,7 +3784,9 @@ impl PreviewPane {
             root,
             meta,
             content,
-            media: RefCell::new(None),
+            video: RefCell::new(None),
+            kind: Cell::new(None),
+            audio_btn: RefCell::new(None),
             audio: RefCell::new(None),
             current: RefCell::new(None),
             gen: Cell::new(0),
@@ -3668,11 +3794,8 @@ impl PreviewPane {
     }
 
     fn stop_media(&self) {
-        if let Some(m) = self.media.borrow_mut().take() {
-            m.pause();
-            if let Some(mf) = m.downcast_ref::<MediaFile>() {
-                mf.clear();
-            }
+        if let Some(v) = self.video.borrow_mut().take() {
+            v.kill();
         }
         if let Some((_stream, sink)) = self.audio.borrow_mut().take() {
             sink.stop();
@@ -3682,6 +3805,8 @@ impl PreviewPane {
     fn clear(&self) {
         self.gen.set(self.gen.get() + 1);
         self.stop_media();
+        self.kind.set(None);
+        self.audio_btn.borrow_mut().take();
         self.current.borrow_mut().take();
         clear_box(&self.content);
         self.root.set_visible(false);
@@ -3785,30 +3910,88 @@ impl PreviewPane {
         }
     }
 
-    fn start_video(&self, path: &Path) {
-        let mf = MediaFile::for_filename(path);
-        mf.set_loop(true);
-        mf.set_muted(true);
-        let video = Picture::for_paintable(&mf);
-        video.set_focusable(false);
-        video.set_overflow(gtk4::Overflow::Hidden);
-        video.set_size_request(PREVIEW_BOX_W, PREVIEW_BOX_H);
-        let clip = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk4::PolicyType::External)
-            .vscrollbar_policy(gtk4::PolicyType::External)
-            .min_content_width(PREVIEW_BOX_W)
-            .max_content_width(PREVIEW_BOX_W)
-            .min_content_height(PREVIEW_BOX_H)
-            .max_content_height(PREVIEW_BOX_H)
-            .propagate_natural_width(false)
-            .propagate_natural_height(false)
-            .focusable(false)
-            .overflow(gtk4::Overflow::Hidden)
-            .child(&video)
-            .build();
+    fn toggle_playback(self: &Rc<Self>) -> bool {
+        match self.kind.get() {
+            Some(PreviewKind::Audio) => {
+                let btn = self.audio_btn.borrow().clone();
+                let path = self.current.borrow().clone();
+                match (btn, path) {
+                    (Some(btn), Some(path)) => {
+                        self.toggle_audio(&path, &btn);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Some(PreviewKind::Video) => {
+                if let Some(v) = self.video.borrow().as_ref() {
+                    v.toggle_pause();
+                    return true;
+                }
+                let path = self.current.borrow().clone();
+                match path {
+                    Some(path) => {
+                        self.gen.set(self.gen.get() + 1);
+                        self.start_video(&path);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn show_video_thumb(self: &Rc<Self>, px: ThumbPixels, path: &Path) {
+        let (pw, ph) = (px.w, px.h);
+        let pic = Picture::for_paintable(&px.into_texture());
+        pic.set_can_shrink(true);
+        pic.set_size_request(pw, ph);
+        pic.set_halign(gtk4::Align::Center);
+        pic.set_valign(gtk4::Align::Center);
+        pic.set_focusable(false);
+        pic.add_css_class("preview-img");
+        pic.set_overflow(gtk4::Overflow::Hidden);
+
+        let btn = Button::with_label("▶");
+        btn.add_css_class("video-play-btn");
+        btn.set_focusable(false);
+        btn.set_halign(gtk4::Align::End);
+        btn.set_valign(gtk4::Align::End);
+        btn.set_margin_bottom(10);
+        btn.set_margin_end(10);
 
         let overlay = Overlay::new();
-        overlay.set_child(Some(&clip));
+        overlay.set_child(Some(&pic));
+        overlay.add_overlay(&btn);
+        overlay.set_overflow(gtk4::Overflow::Hidden);
+        overlay.add_css_class("preview-video");
+
+        let me = self.clone();
+        let p = path.to_path_buf();
+        let id = self.gen.get();
+        btn.connect_clicked(move |_| {
+            let me = me.clone();
+            let p = p.clone();
+            glib::idle_add_local_once(move || {
+                if me.gen.get() == id {
+                    me.start_video(&p);
+                }
+            });
+        });
+        self.set_content(overlay.upcast_ref());
+    }
+
+    fn start_video(&self, path: &Path) {
+        let (w, h) = (PREVIEW_BOX_W, PREVIEW_BOX_H);
+        let video = Picture::new();
+        video.set_focusable(false);
+        video.set_can_shrink(true);
+        video.set_size_request(w, h);
+        video.set_overflow(gtk4::Overflow::Hidden);
+
+        let overlay = Overlay::new();
+        overlay.set_child(Some(&video));
         overlay.set_overflow(gtk4::Overflow::Hidden);
         overlay.add_css_class("preview-video");
 
@@ -3821,37 +4004,57 @@ impl PreviewPane {
         play_btn.set_margin_end(10);
         overlay.add_overlay(&play_btn);
 
-        let weak_mf = mf.downgrade();
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let pid = Arc::new(AtomicI32::new(-1));
+        let (tx, rx) = async_channel::bounded::<Vec<u8>>(2);
+        {
+            let (stop, paused, pid) = (stop.clone(), paused.clone(), pid.clone());
+            let path = path.to_path_buf();
+            std::thread::spawn(move || run_video_worker(path, w, h, tx, stop, paused, pid));
+        }
+
+        let weak_pic = video.downgrade();
+        glib::spawn_future_local(async move {
+            while let Ok(buf) = rx.recv().await {
+                let Some(pic) = weak_pic.upgrade() else {
+                    break;
+                };
+                let tex = gtk4::gdk::MemoryTexture::new(
+                    w,
+                    h,
+                    gtk4::gdk::MemoryFormat::R8g8b8a8,
+                    &glib::Bytes::from_owned(buf),
+                    (w * 4) as usize,
+                );
+                pic.set_paintable(Some(&tex));
+            }
+        });
+
+        let weak_btn = play_btn.downgrade();
+        let paused_t = paused.clone();
         let toggle = move || {
-            if let Some(mf) = weak_mf.upgrade() {
-                if mf.is_playing() {
-                    mf.pause();
-                } else {
-                    mf.play();
-                }
+            let now = !paused_t.load(Ordering::SeqCst);
+            paused_t.store(now, Ordering::SeqCst);
+            if let Some(b) = weak_btn.upgrade() {
+                b.set_label(if now { "▶" } else { "⏸" });
             }
         };
-
         {
             let toggle = toggle.clone();
             play_btn.connect_clicked(move |_| toggle());
         }
         let click = gtk4::GestureClick::new();
         click.connect_released(move |_, _, _, _| toggle());
-        clip.add_controller(click);
-
-        {
-            let weak_btn = play_btn.downgrade();
-            mf.connect_playing_notify(move |m| {
-                if let Some(btn) = weak_btn.upgrade() {
-                    btn.set_label(if m.is_playing() { "⏸" } else { "▶" });
-                }
-            });
-        }
+        overlay.add_controller(click);
 
         self.set_content(overlay.upcast_ref());
-        *self.media.borrow_mut() = Some(mf.clone().upcast());
-        mf.play();
+        *self.video.borrow_mut() = Some(VideoHandle {
+            stop,
+            pid,
+            paused: paused.clone(),
+            btn: play_btn.downgrade(),
+        });
     }
 
     fn show(self: &Rc<Self>, path: &Path) {
@@ -3862,13 +4065,29 @@ impl PreviewPane {
         self.gen.set(id);
         *self.current.borrow_mut() = Some(path.to_path_buf());
 
-        let kind = preview_kind(path);
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        self.meta
-            .set_text(&format!("{} · {}", kind.label(), human_size(size)));
         self.root.set_visible(true);
+        self.kind.set(None);
+        self.meta.set_text("");
+        self.set_content(self.message("Loading…").upcast_ref());
 
         let p = path.to_path_buf();
+        let probe = p.clone();
+        self.spawn_load(
+            id,
+            move || {
+                (
+                    preview_kind(&probe),
+                    std::fs::metadata(&probe).map(|m| m.len()).unwrap_or(0),
+                )
+            },
+            move |me, (kind, size)| me.show_kind(id, kind, size, p),
+        );
+    }
+
+    fn show_kind(self: &Rc<Self>, id: u64, kind: PreviewKind, size: u64, p: PathBuf) {
+        self.kind.set(Some(kind));
+        self.meta
+            .set_text(&format!("{} · {}", kind.label(), human_size(size)));
         match kind {
             PreviewKind::Text => {
                 self.set_content(self.message("Loading…").upcast_ref());
@@ -3917,14 +4136,15 @@ impl PreviewPane {
                 );
             }
             PreviewKind::Video => {
-                self.set_content(self.message("Loading…").upcast_ref());
-                let me = self.clone();
-                glib::timeout_add_local_once(Duration::from_millis(180), move || {
-                    if me.gen.get() != id {
-                        return;
-                    }
-                    me.start_video(&p);
-                });
+                let probe = p.clone();
+                self.spawn_load(
+                    id,
+                    move || render_video_thumb(&probe, id),
+                    move |me, res| match res {
+                        Ok(px) => me.show_video_thumb(px, &p),
+                        Err(msg) => me.set_content(me.message(&msg).upcast_ref()),
+                    },
+                );
             }
             PreviewKind::Audio => {
                 let icon = Image::from_file("/var/lib/cynager/icons/audio.svg");
@@ -3939,6 +4159,7 @@ impl PreviewPane {
                 btn.set_valign(gtk4::Align::End);
                 btn.set_margin_bottom(10);
                 btn.set_margin_end(10);
+                *self.audio_btn.borrow_mut() = Some(btn.clone());
                 let me = self.clone();
                 let b2 = btn.clone();
                 btn.connect_clicked(move |_| me.toggle_audio(&p, &b2));
@@ -4225,6 +4446,10 @@ impl ModePanel {
         }
         let typed = self.entry.text().to_string();
         self.update_ghost(&typed);
+    }
+
+    fn toggle_preview_playback(&self) -> bool {
+        self.preview.toggle_playback()
     }
 
     fn focus_apps(&self) {
@@ -4936,6 +5161,17 @@ fn build_window(
                 });
                 return glib::Propagation::Stop;
             }
+            if ui.active()
+                && key == gtk4::gdk::Key::space
+                && !state.intersects(
+                    gtk4::gdk::ModifierType::CONTROL_MASK
+                        | gtk4::gdk::ModifierType::ALT_MASK
+                        | gtk4::gdk::ModifierType::SUPER_MASK,
+                )
+                && ui.panel.toggle_preview_playback()
+            {
+                return glib::Propagation::Stop;
+            }
             if ui.active() {
                 match key {
                     gtk4::gdk::Key::Down => {
@@ -5601,7 +5837,7 @@ fn main() -> glib::ExitCode {
             }
         };
 
-        let (tx, rx) = async_channel::unbounded::<()>();
+        let (tx, rx) = async_channel::bounded::<()>(1);
         spawn_super_watchers(tx);
         let toggle_for_keys = toggle.clone();
         glib::spawn_future_local(async move {
